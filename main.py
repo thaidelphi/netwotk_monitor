@@ -28,7 +28,7 @@ def _run_cli_scan(range_start: str, range_end: str, ports_str: str) -> int:
     for r in online:
         print(
             f"  [ONLINE] {r.ip:<15} | {r.latency_text:<10} | {r.mac:<17} | "
-            f"{r.vendor:<24} | Host: {r.hostname} | Ports: {r.ports_display}"
+            f"{r.vendor:<24} | OS: {r.os_name:<28} | Host: {r.hostname} | Ports: {r.ports_display}"
         )
     return 0
 

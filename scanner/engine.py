@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from .network_utils import COMMON_PORTS, NetworkInterface
+from .os_fingerprint import collect_host_banners, detect_os
 from .oui_db import lookup_mac_vendor, normalize_mac
 
 # Win32 iphlpapi function bindings (64-bit safe)
@@ -76,9 +77,15 @@ class HostScanResult:
     mac: str = "-"
     vendor: str = "-"
     device_type: str = "-"
+    os_name: str = "-"
+    os_confidence: str = "-"
+    os_evidence: str = "-"
     open_ports: list[int] = field(default_factory=list)
+    port_banners: dict[int, str] = field(default_factory=dict)
+    smb_info: dict[str, str] = field(default_factory=dict)
     discovery_method: str = "-"
     ttl: int | None = None
+    deep_inspected: bool = False
 
     @property
     def ports_display(self) -> str:
@@ -466,6 +473,17 @@ class LanScannerEngine:
                     if is_open:
                         open_ports.append(p)
             vendor = lookup_mac_vendor(iface.mac)
+            banner_data = collect_host_banners(ip_str, open_ports, timeout_scale=0.6)
+            os_name, os_conf, os_ev = detect_os(
+                is_local_pc=True,
+                open_ports=open_ports,
+                ttl=128,
+                vendor=vendor,
+                hostname=local_name,
+                smb_info=banner_data["smb"],  # type: ignore[arg-type]
+                ssh_banner=banner_data["ssh"],  # type: ignore[arg-type]
+                http_infos=banner_data["http"],  # type: ignore[arg-type]
+            )
             return HostScanResult(
                 ip=ip_str,
                 online=True,
@@ -475,7 +493,12 @@ class LanScannerEngine:
                 mac=iface.mac,
                 vendor=vendor,
                 device_type="เครื่องนี้ (This PC)",
+                os_name=os_name,
+                os_confidence=os_conf,
+                os_evidence=os_ev,
                 open_ports=open_ports,
+                port_banners=banner_data["banners"],  # type: ignore[arg-type]
+                smb_info=banner_data["smb"],  # type: ignore[arg-type]
                 discovery_method="Local NIC",
                 ttl=128,
             )
@@ -582,6 +605,30 @@ class LanScannerEngine:
 
         final_mac = mac_addr if mac_addr else "-"
         vendor = lookup_mac_vendor(final_mac) if final_mac != "-" else "-"
+
+        # 6. Banner Grabbing & OS Detection
+        banner_data = {"smb": {}, "ssh": "", "http": [], "banners": {}}
+        if open_ports_list and not self._stop_event.is_set():
+            banner_data = collect_host_banners(ip_str, open_ports_list, timeout_scale=1.0)
+            smb_dict: dict[str, str] = banner_data["smb"]  # type: ignore[assignment]
+            if hostname == "-" and smb_dict.get("dns_computer"):
+                hostname = smb_dict["dns_computer"]
+            elif hostname == "-" and smb_dict.get("nb_computer"):
+                hostname = smb_dict["nb_computer"]
+            if not workgroup and smb_dict.get("nb_domain"):
+                workgroup = smb_dict["nb_domain"]
+
+        os_name, os_conf, os_ev = detect_os(
+            is_local_pc=False,
+            open_ports=open_ports_list,
+            ttl=ttl,
+            vendor=vendor,
+            hostname=hostname,
+            smb_info=banner_data["smb"],  # type: ignore[arg-type]
+            ssh_banner=banner_data["ssh"],  # type: ignore[arg-type]
+            http_infos=banner_data["http"],  # type: ignore[arg-type]
+        )
+
         dev_type = infer_device_type(
             ip_str=ip_str,
             is_local_pc=False,
@@ -602,7 +649,12 @@ class LanScannerEngine:
             mac=final_mac,
             vendor=vendor,
             device_type=dev_type,
+            os_name=os_name,
+            os_confidence=os_conf,
+            os_evidence=os_ev,
             open_ports=open_ports_list,
+            port_banners=banner_data["banners"],  # type: ignore[arg-type]
+            smb_info=banner_data["smb"],  # type: ignore[arg-type]
             discovery_method=discovery_method,
             ttl=ttl,
         )

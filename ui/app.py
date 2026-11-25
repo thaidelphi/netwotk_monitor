@@ -16,6 +16,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from scanner import (
+    COMMON_PORTS,
     PORT_PRESETS,
     HostScanResult,
     LanScannerEngine,
@@ -52,6 +53,7 @@ class LanScannerApp:
         "status",
         "ip",
         "hostname",
+        "os",
         "latency",
         "mac",
         "vendor",
@@ -424,9 +426,19 @@ class LanScannerApp:
             command=lambda: self.search_var.set(""),
         ).pack(side="left")
 
-        # 5. Results Table (Treeview)
-        table_outer = tk.Frame(body, bg="#CBD5E1", padx=1, pady=1)
-        table_outer.pack(fill="both", expand=True, pady=(0, 8))
+        # 5. Split Workspace: Results Table (Left) + Device Detail Inspector (Right)
+        paned = tk.PanedWindow(
+            body,
+            orient="horizontal",
+            bg="#F1F5F9",
+            sashwidth=6,
+            sashrelief="flat",
+            bd=0,
+        )
+        paned.pack(fill="both", expand=True)
+
+        table_outer = tk.Frame(paned, bg="#CBD5E1", padx=1, pady=1)
+        paned.add(table_outer, stretch="always", minsize=560)
         table_frame = ttk.Frame(table_outer, style="Card.TFrame")
         table_frame.pack(fill="both", expand=True)
         table_frame.rowconfigure(0, weight=1)
@@ -448,19 +460,20 @@ class LanScannerApp:
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         self._headings_meta: dict[str, tuple[str, int, str]] = {
-            "status": ("สถานะ", 95, "center"),
-            "ip": ("IP Address", 130, "w"),
-            "hostname": ("ชื่อเครื่อง (Hostname)", 200, "w"),
-            "latency": ("Ping", 95, "center"),
-            "mac": ("MAC Address", 145, "center"),
-            "vendor": ("ยี่ห้ออุปกรณ์ (Vendor)", 190, "w"),
-            "device_type": ("ประเภทอุปกรณ์", 150, "w"),
-            "ports": ("พอร์ตที่เปิด (Open Ports)", 250, "w"),
+            "status": ("สถานะ", 88, "center"),
+            "ip": ("IP Address", 120, "w"),
+            "hostname": ("ชื่อเครื่อง (Hostname)", 165, "w"),
+            "os": ("ระบบปฏิบัติการ (OS)", 185, "w"),
+            "latency": ("Ping", 85, "center"),
+            "mac": ("MAC Address", 135, "center"),
+            "vendor": ("ยี่ห้ออุปกรณ์ (Vendor)", 165, "w"),
+            "device_type": ("ประเภทอุปกรณ์", 135, "w"),
+            "ports": ("พอร์ตที่เปิด (Open Ports)", 210, "w"),
         }
         for col_id, (label, width, anchor) in self._headings_meta.items():
             self.tree.heading(col_id, text=label, command=lambda c=col_id: self.sort_by_column(c))
-            stretch = col_id in ("hostname", "vendor", "ports")
-            self.tree.column(col_id, width=width, minwidth=75, anchor=anchor, stretch=stretch)
+            stretch = col_id in ("hostname", "os", "vendor", "ports")
+            self.tree.column(col_id, width=width, minwidth=70, anchor=anchor, stretch=stretch)
 
         # Row color tags
         self.tree.tag_configure("online_even", background="#FFFFFF", foreground="#0F172A")
@@ -468,41 +481,136 @@ class LanScannerApp:
         self.tree.tag_configure("local_pc", background="#ECFDF5", foreground="#065F46")
         self.tree.tag_configure("offline_row", background="#FAFAFA", foreground="#94A3B8")
 
-        # 6. Bottom Inspector & Quick Action Strip
-        bottom_outer = tk.Frame(body, bg="#CBD5E1", padx=1, pady=1)
-        bottom_outer.pack(fill="x")
-        bottom_bar = ttk.Frame(bottom_outer, style="Card.TFrame", padding=(12, 8))
-        bottom_bar.pack(fill="x")
+        # 6. Right Pane: Rich Device Detail Inspector
+        insp_outer = tk.Frame(paned, bg="#CBD5E1", padx=1, pady=1)
+        paned.add(insp_outer, stretch="never", minsize=340, width=370)
+        insp_card = ttk.Frame(insp_outer, style="Card.TFrame", padding=(12, 10))
+        insp_card.pack(fill="both", expand=True)
 
-        ttk.Label(
-            bottom_bar,
-            textvariable=self.detail_var,
-            style="Muted.TLabel",
-        ).pack(side="left", fill="x", expand=True)
+        insp_hdr = ttk.Frame(insp_card, style="Card.TFrame")
+        insp_hdr.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            insp_hdr,
+            text="รายละเอียดเครื่องที่เลือก",
+            bg="#FFFFFF",
+            fg="#0F172A",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+        self.btn_deep_inspect = ttk.Button(
+            insp_hdr,
+            text="🔍 เจาะลึกเครื่องนี้",
+            style="Primary.TButton",
+            command=self.deep_inspect_selected_host,
+        )
+        self.btn_deep_inspect.pack(side="right")
 
-        quick_btns = ttk.Frame(bottom_bar, style="Card.TFrame")
-        quick_btns.pack(side="right")
-        ttk.Button(quick_btns, text="คัดลอก IP", style="Soft.TButton", command=self.copy_selected_ip).pack(
-            side="left", padx=(0, 5)
+        self.insp_ip_banner = tk.Label(
+            insp_card,
+            text="คลิกเลือกเครื่องในตารางเพื่อดูรายละเอียด",
+            bg="#F8FAFC",
+            fg="#1E293B",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            padx=10,
+            pady=6,
+            bd=1,
+            relief="solid",
         )
-        ttk.Button(quick_btns, text="คัดลอก MAC", style="Soft.TButton", command=self.copy_selected_mac).pack(
-            side="left", padx=(0, 5)
+        self.insp_ip_banner.pack(fill="x", pady=(0, 8))
+
+        # Structured Key-Value Inspector Grid
+        kv_frame = ttk.Frame(insp_card, style="Card.TFrame")
+        kv_frame.pack(fill="x", pady=(0, 8))
+        kv_frame.columnconfigure(1, weight=1)
+
+        self._insp_vars: dict[str, tk.StringVar] = {}
+        insp_fields = [
+            ("os", "ระบบปฏิบัติการ:"),
+            ("os_ev", "หลักฐาน OS:"),
+            ("hostname", "ชื่อเครื่อง:"),
+            ("workgroup", "Workgroup/Domain:"),
+            ("mac", "MAC Address:"),
+            ("vendor", "ยี่ห้อ (Vendor):"),
+            ("device_type", "ประเภทอุปกรณ์:"),
+            ("net_info", "Ping / TTL / วิธีพบ:"),
+        ]
+        for row_idx, (key, label_txt) in enumerate(insp_fields):
+            tk.Label(
+                kv_frame,
+                text=label_txt,
+                bg="#FFFFFF",
+                fg="#64748B",
+                font=("Segoe UI", 9, "bold"),
+                anchor="nw",
+            ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2)
+            var = tk.StringVar(value="-")
+            self._insp_vars[key] = var
+            tk.Label(
+                kv_frame,
+                textvariable=var,
+                bg="#FFFFFF",
+                fg="#0F172A",
+                font=("Segoe UI", 9),
+                anchor="nw",
+                justify="left",
+                wraplength=220,
+            ).grid(row=row_idx, column=1, sticky="new", pady=2)
+
+        tk.Label(
+            insp_card,
+            text="พอร์ตที่เปิด & ข้อมูลบริการ (Service Banners):",
+            bg="#FFFFFF",
+            fg="#334155",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(4, 4))
+
+        txt_wrap = tk.Frame(insp_card, bg="#CBD5E1", padx=1, pady=1)
+        txt_wrap.pack(fill="both", expand=True, pady=(0, 8))
+        self.insp_ports_text = tk.Text(
+            txt_wrap,
+            height=7,
+            bg="#F8FAFC",
+            fg="#0F172A",
+            font=("Consolas", 9),
+            relief="flat",
+            wrap="word",
+            padx=8,
+            pady=6,
+            state="disabled",
         )
-        ttk.Button(quick_btns, text="เปิดเว็บ", style="Soft.TButton", command=self.open_selected_web).pack(
-            side="left", padx=(0, 5)
+        self.insp_ports_text.pack(fill="both", expand=True)
+
+        # Quick Actions Grid (2 rows of 3 buttons)
+        qa_frame = ttk.Frame(insp_card, style="Card.TFrame")
+        qa_frame.pack(fill="x")
+        for c_i in range(3):
+            qa_frame.columnconfigure(c_i, weight=1)
+
+        ttk.Button(qa_frame, text="คัดลอก IP", style="Soft.TButton", command=self.copy_selected_ip).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4)
         )
-        ttk.Button(quick_btns, text="Remote RDP", style="Soft.TButton", command=self.open_selected_rdp).pack(
-            side="left", padx=(0, 5)
+        ttk.Button(qa_frame, text="คัดลอก MAC", style="Soft.TButton", command=self.copy_selected_mac).grid(
+            row=0, column=1, sticky="ew", padx=(0, 4), pady=(0, 4)
         )
-        ttk.Button(quick_btns, text="แชร์ไฟล์ \\\\IP", style="Soft.TButton", command=self.open_selected_smb).pack(
-            side="left", padx=(0, 5)
+        ttk.Button(qa_frame, text="เปิดเว็บ", style="Soft.TButton", command=self.open_selected_web).grid(
+            row=0, column=2, sticky="ew", pady=(0, 4)
         )
-        ttk.Button(quick_btns, text="สแกนซ้ำจุดนี้", style="Soft.TButton", command=self.rescan_selected_host).pack(
-            side="left"
+        ttk.Button(qa_frame, text="Remote RDP", style="Soft.TButton", command=self.open_selected_rdp).grid(
+            row=1, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(qa_frame, text="แชร์ไฟล์ \\\\IP", style="Soft.TButton", command=self.open_selected_smb).grid(
+            row=1, column=1, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(qa_frame, text="Ping ต่อเนื่อง", style="Soft.TButton", command=self.open_selected_ping_cmd).grid(
+            row=1, column=2, sticky="ew"
         )
 
         # Right-click Context Menu
         self.ctx_menu = tk.Menu(self.root, tearoff=0, font=("Segoe UI", 9))
+        self.ctx_menu.add_command(label="🔍 เจาะลึกเครื่องนี้ (สแกนพอร์ตเพิ่ม + ตรวจ OS)", command=self.deep_inspect_selected_host)
+        self.ctx_menu.add_command(label="สแกนเครื่องนี้ซ้ำอีกครั้ง", command=self.rescan_selected_host)
+        self.ctx_menu.add_separator()
         self.ctx_menu.add_command(label="คัดลอก IP Address", command=self.copy_selected_ip)
         self.ctx_menu.add_command(label="คัดลอก MAC Address", command=self.copy_selected_mac)
         self.ctx_menu.add_command(label="คัดลอกข้อมูลทั้งแถว", command=self.copy_selected_row)
@@ -510,8 +618,7 @@ class LanScannerApp:
         self.ctx_menu.add_command(label="เปิดผ่านเว็บเบราว์เซอร์ (HTTP / HTTPS)", command=self.open_selected_web)
         self.ctx_menu.add_command(label="เชื่อมต่อ Remote Desktop (RDP)", command=self.open_selected_rdp)
         self.ctx_menu.add_command(label="เปิดโฟลเดอร์แชร์ (\\\\IP)", command=self.open_selected_smb)
-        self.ctx_menu.add_separator()
-        self.ctx_menu.add_command(label="สแกนเครื่องนี้ซ้ำอีกครั้ง", command=self.rescan_selected_host)
+        self.ctx_menu.add_command(label="Ping ต่อเนื่องในหน้าต่าง CMD", command=self.open_selected_ping_cmd)
 
         self._update_heading_arrows()
 
@@ -710,6 +817,32 @@ class LanScannerApp:
         )
         worker.start()
 
+    def deep_inspect_selected_host(self) -> None:
+        """Scan all common ports (28 ports) and grab SMB/SSH/HTTP banners & OS for the selected host."""
+        if self.engine.is_running:
+            return
+        res = self._get_selected_result()
+        if not res:
+            messagebox.showinfo("เลือกเครื่องก่อน", "กรุณาคลิกเลือกเครื่องในตารางที่ต้องการเจาะลึก", parent=self.root)
+            return
+        all_ports = sorted(COMMON_PORTS.keys())
+        config = ScanConfig(
+            target_ips=[res.ip],
+            scan_ports=True,
+            ports=all_ports,
+            ping_timeout_ms=900,
+            port_timeout_sec=0.45,
+            max_workers=1,
+            resolve_hostname=True,
+            local_interfaces=self.interfaces,
+        )
+        self.status_text_var.set(f"กำลังเจาะลึก {res.ip} (สแกน {len(all_ports)} พอร์ต + ตรวจจับ OS & Banner)...")
+        self._set_scanning_ui_state(True)
+        worker = threading.Thread(
+            target=self._scan_worker_thread, args=(config, True), daemon=True
+        )
+        worker.start()
+
     def _scan_worker_thread(self, config: ScanConfig, is_single_rescan: bool) -> None:
         def on_host_done(res: HostScanResult, done_count: int, total_count: int) -> None:
             self.event_queue.put(("host", res, done_count, total_count, is_single_rescan))
@@ -779,6 +912,7 @@ class LanScannerApp:
     def _set_scanning_ui_state(self, scanning: bool) -> None:
         self.btn_start.configure(state="disabled" if scanning else "normal")
         self.btn_stop.configure(state="normal" if scanning else "disabled")
+        self.btn_deep_inspect.configure(state="disabled" if scanning else "normal")
         self.ent_start_ip.configure(state="disabled" if scanning else "normal")
         self.ent_end_ip.configure(state="disabled" if scanning else "normal")
         self.cmb_adapter.configure(state="disabled" if scanning else "readonly")
@@ -802,6 +936,8 @@ class LanScannerApp:
             return (ip_to_int(res.ip),)
         if col == "hostname":
             return (0 if res.hostname != "-" else 1, res.hostname.lower(), ip_to_int(res.ip))
+        if col == "os":
+            return (0 if res.os_name != "-" else 1, res.os_name.lower(), ip_to_int(res.ip))
         if col == "latency":
             val = res.latency_ms if (res.online and res.latency_ms is not None) else 999999
             return (val, ip_to_int(res.ip))
@@ -849,6 +985,8 @@ class LanScannerApp:
                         res.ip,
                         res.hostname,
                         res.workgroup,
+                        res.os_name,
+                        res.os_evidence,
                         res.mac,
                         res.vendor,
                         res.device_type,
@@ -879,6 +1017,7 @@ class LanScannerApp:
                     status_str,
                     res.ip,
                     res.hostname,
+                    res.os_name,
                     res.latency_text,
                     res.mac,
                     res.vendor,
@@ -901,13 +1040,72 @@ class LanScannerApp:
         res = self._get_selected_result()
         if not res:
             return
-        wg_str = f" | Workgroup: {res.workgroup}" if res.workgroup else ""
-        ttl_str = f" | TTL: {res.ttl}" if res.ttl is not None else ""
-        method_str = f" | ตรวจพบด้วย: {res.discovery_method}" if res.discovery_method != "-" else ""
-        self.detail_var.set(
-            f"IP: {res.ip}  •  ชื่อเครื่อง: {res.hostname}{wg_str}  •  MAC: {res.mac} ({res.vendor})"
-            f"{method_str}{ttl_str}  •  พอร์ต: {res.ports_display}"
+
+        if res.online:
+            self.insp_ip_banner.configure(
+                text=f"● {res.ip}  —  Online ({res.device_type})",
+                bg="#ECFDF5",
+                fg="#065F46",
+            )
+        else:
+            self.insp_ip_banner.configure(
+                text=f"○ {res.ip}  —  Offline",
+                bg="#F1F5F9",
+                fg="#64748B",
+            )
+
+        self._insp_vars["os"].set(
+            f"{res.os_name}  [{res.os_confidence}]" if res.os_name != "-" else "-"
         )
+        self._insp_vars["os_ev"].set(res.os_evidence or "-")
+        self._insp_vars["hostname"].set(res.hostname or "-")
+        wg_val = res.workgroup or res.smb_info.get("dns_domain") or res.smb_info.get("nb_domain") or "-"
+        self._insp_vars["workgroup"].set(wg_val)
+        self._insp_vars["mac"].set(res.mac or "-")
+        self._insp_vars["vendor"].set(res.vendor or "-")
+        self._insp_vars["device_type"].set(res.device_type or "-")
+        ttl_txt = f"TTL={res.ttl}" if res.ttl is not None else "TTL=-"
+        self._insp_vars["net_info"].set(
+            f"{res.latency_text}  •  {ttl_txt}  •  {res.discovery_method}"
+        )
+
+        # Build rich ports & banner details
+        lines: list[str] = []
+        if res.open_ports:
+            for p in res.open_ports:
+                svc = COMMON_PORTS.get(p, "TCP")
+                banner = res.port_banners.get(p, "")
+                if banner:
+                    lines.append(f"• Port {p:<5} ({svc})\n  └─ {banner}")
+                else:
+                    lines.append(f"• Port {p:<5} ({svc}) — Open")
+        else:
+            lines.append("ไม่พบพอร์ตที่เปิดในช่วงที่สแกน" if res.online else "เครื่องไม่ตอบสนอง (Offline)")
+
+        if res.smb_info:
+            extra_smb = []
+            for k, lbl in (
+                ("nb_computer", "NetBIOS Name"),
+                ("dns_computer", "FQDN"),
+                ("dns_domain", "AD/DNS Domain"),
+                ("ntlm_version", "NTLM OS Ver"),
+            ):
+                if res.smb_info.get(k):
+                    extra_smb.append(f"  {lbl}: {res.smb_info[k]}")
+            if extra_smb:
+                lines.append("\n[ข้อมูล SMB / Windows]")
+                lines.extend(extra_smb)
+
+        self.insp_ports_text.configure(state="normal")
+        self.insp_ports_text.delete("1.0", "end")
+        self.insp_ports_text.insert("1.0", "\n".join(lines))
+        self.insp_ports_text.configure(state="disabled")
+
+    def open_selected_ping_cmd(self) -> None:
+        res = self._get_selected_result()
+        if not res:
+            return
+        subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", f"ping -t {res.ip}"])
 
     def _on_right_click(self, event: tk.Event) -> None:
         row_id = self.tree.identify_row(event.y)
@@ -1008,27 +1206,36 @@ class LanScannerApp:
                         "IP Address",
                         "Hostname",
                         "Workgroup",
+                        "OS",
+                        "OS Confidence",
+                        "OS Evidence",
                         "Ping",
                         "MAC Address",
                         "Vendor",
                         "ประเภทอุปกรณ์",
                         "Open Ports",
+                        "Service Banners",
                         "วิธีตรวจพบ",
                         "TTL",
                     ]
                 )
                 for r in rows:
+                    banners_str = " | ".join(f"{p}: {b}" for p, b in sorted(r.port_banners.items()))
                     writer.writerow(
                         [
                             "Online" if r.online else "Offline",
                             r.ip,
                             r.hostname,
                             r.workgroup,
+                            r.os_name,
+                            r.os_confidence,
+                            r.os_evidence,
                             r.latency_text,
                             r.mac,
                             r.vendor,
                             r.device_type,
                             r.ports_display,
+                            banners_str,
                             r.discovery_method,
                             r.ttl if r.ttl is not None else "",
                         ]
@@ -1061,6 +1268,9 @@ class LanScannerApp:
                     "online": r.online,
                     "hostname": r.hostname,
                     "workgroup": r.workgroup,
+                    "os_name": r.os_name,
+                    "os_confidence": r.os_confidence,
+                    "os_evidence": r.os_evidence,
                     "latency_ms": r.latency_ms,
                     "latency_text": r.latency_text,
                     "mac": r.mac,
@@ -1068,6 +1278,8 @@ class LanScannerApp:
                     "device_type": r.device_type,
                     "open_ports": r.open_ports,
                     "ports_display": r.ports_display,
+                    "port_banners": {str(k): v for k, v in r.port_banners.items()},
+                    "smb_info": r.smb_info,
                     "discovery_method": r.discovery_method,
                     "ttl": r.ttl,
                 }
