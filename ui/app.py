@@ -942,6 +942,7 @@ class LanScannerApp:
         txt.tag_configure("LOW", foreground="#0369A1", font=("Segoe UI", 10, "bold"))
         txt.tag_configure("INFO", foreground="#475569", font=("Segoe UI", 10, "bold"))
         txt.tag_configure("remedy", foreground="#065F46", font=("Segoe UI", 9, "bold"))
+        txt.tag_configure("cve", foreground="#7C3AED", font=("Consolas", 9, "bold"))
         txt.tag_configure("body", foreground="#1E293B", font=("Segoe UI", 9))
 
         plain_report: list[str] = [
@@ -954,11 +955,16 @@ class LanScannerApp:
             port_tag = f" (Port {f.port})" if f.port else ""
             header_line = f"{idx}. [{f.severity}] {f.title}{port_tag}\n"
             txt.insert("end", header_line, f.severity)
+            if f.cve_ids:
+                cve_line = f"   อ้างอิง CVE/CWE: {', '.join(f.cve_ids)}\n"
+                txt.insert("end", cve_line, "cve")
             txt.insert("end", f"   รายละเอียด: {f.description}\n", "body")
             txt.insert("end", f"   แนวทางแก้ไข: {f.remediation}\n\n", "remedy")
+            plain_report.append(header_line.strip())
+            if f.cve_ids:
+                plain_report.append(f"   อ้างอิง CVE/CWE: {', '.join(f.cve_ids)}")
             plain_report.extend(
                 [
-                    header_line.strip(),
                     f"   รายละเอียด: {f.description}",
                     f"   แนวทางแก้ไข: {f.remediation}",
                     "",

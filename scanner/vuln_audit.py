@@ -1,8 +1,9 @@
-"""Defensive LAN Host Vulnerability & Exposure Audit (configuration, cleartext, cert, and EOL checks)."""
+"""Defensive LAN Host Vulnerability & Exposure Audit with CVE / CWE reference matching."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import date
 
 from .engine import HostScanResult
@@ -23,12 +24,21 @@ class VulnFinding:
     port: int | None
     description: str
     remediation: str
+    cve_ids: list[str] = field(default_factory=list)
+
+
+def _parse_openssh_version(banner: str) -> tuple[int, int] | None:
+    """Extract (major, minor) from SSH banner like 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3'."""
+    m = re.search(r"OpenSSH[_\s]+(\d+)\.(\d+)", banner, re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
 
 
 def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
     """
-    Analyze a HostScanResult for common network exposure, cleartext protocols,
-    weak authentication, certificate issues, and end-of-life OS risks.
+    Analyze a HostScanResult for network exposure, cleartext protocols,
+    weak authentication, certificate issues, EOL OS, and version-matched CVEs.
     """
     if not res.online:
         return [
@@ -55,6 +65,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=5900,
                     description=f"พอร์ต 5900 ตอบกลับ: {vnc_banner} ทำให้ทุกคนในวงแลนเข้าควบคุมหน้าจอได้ทันที",
                     remediation="ตั้งรหัสผ่าน VNC, เปิดใช้การเข้ารหัส (TLS/VeNCrypt) หรือจำกัด IP ด้วย Firewall",
+                    cve_ids=["CWE-306"],
                 )
             )
         else:
@@ -65,6 +76,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=5900,
                     description=f"พบพอร์ต VNC เปิดใช้งาน ({vnc_banner or 'RFB'}) ซึ่งมักไม่เข้ารหัสทราฟฟิก",
                     remediation="ใช้งานผ่าน SSH Tunnel / VPN หรือปิดบริการหากไม่จำเป็น",
+                    cve_ids=["CWE-319"],
                 )
             )
 
@@ -77,6 +89,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=23,
                 description="โปรโตคอล Telnet ส่งชื่อผู้ใช้และรหัสผ่านเป็น Plaintext เสี่ยงต่อการดักจับข้อมูลในวงแลน",
                 remediation="ปิดบริการ Telnet แล้วเปลี่ยนไปใช้ SSH (Port 22) หรือ HTTPS แทน",
+                cve_ids=["CWE-319", "CWE-522"],
             )
         )
 
@@ -88,19 +101,40 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=21,
                 description=f"พบพอร์ต FTP เปิดใช้งาน ({res.port_banners.get(21, 'FTP')})",
                 remediation="เปลี่ยนไปใช้ SFTP (SSH) หรือ FTPS (TLS) และปิด Anonymous Login",
+                cve_ids=["CWE-319"],
             )
         )
 
-    # 3. End-of-Life Windows OS
+    # 3. End-of-Life Windows OS & Windows Build-based CVE indicators
     os_low = res.os_name.lower()
+    os_build_str = res.smb_info.get("os_build", "")
+    os_build = int(os_build_str) if os_build_str.isdigit() else None
+
     if any(eol in os_low for eol in ("windows 7", "windows 8", "windows xp", "2008", "2012", "2003")):
+        eol_cves: list[str] = []
+        if 445 in ports:
+            eol_cves.extend(["CVE-2017-0144 (EternalBlue)", "CVE-2017-0145"])
+        if 3389 in ports and any(k in os_low for k in ("windows 7", "2008", "xp", "2003")):
+            eol_cves.append("CVE-2019-0708 (BlueKeep)")
         findings.append(
             VulnFinding(
                 severity="HIGH",
                 title="ระบบปฏิบัติการหมดระยะสนับสนุน (End-of-Life OS)",
-                port=None,
-                description=f"ตรวจพบ OS: {res.os_name} ซึ่งไม่ได้รับแพตช์อุดช่องโหว่ความปลอดภัยจากผู้ผลิตแล้ว",
-                remediation="อัปเกรดเป็น Windows 10/11 หรือ Windows Server รุ่นที่ยังรองรับ หรือแยก VLAN เฉพาะ",
+                port=445 if 445 in ports else (3389 if 3389 in ports else None),
+                description=f"ตรวจพบ OS: {res.os_name} ซึ่งไม่ได้รับแพตช์ความปลอดภัยจากผู้ผลิตแล้ว (ควรตรวจสอบสถานะแพตช์ย้อนหลัง)",
+                remediation="อัปเกรดเป็น Windows 10/11 หรือ Windows Server รุ่นที่ยังรองรับ ปิด SMBv1 และเปิดใช้ NLA",
+                cve_ids=eol_cves or ["CWE-1104"],
+            )
+        )
+    elif os_build in (18362, 18363) and 445 in ports:
+        findings.append(
+            VulnFinding(
+                severity="HIGH",
+                title="Windows 10 รุ่น 1903/1909 (ตรวจสอบแพตช์ SMBv3 Compression)",
+                port=445,
+                description=f"ตรวจพบ SMB Build {os_build} ซึ่งอยู่ในช่วงเวอร์ชันที่เคยมีช่องโหว่ SMBGhost หากยังไม่อัปเดต KB4551762",
+                remediation="ตรวจสอบ Windows Update ให้ติดตั้งแพตช์ KB4551762 หรืออัปเกรดเป็น Windows 10/11 รุ่นล่าสุด",
+                cve_ids=["CVE-2020-0796 (SMBGhost)"],
             )
         )
 
@@ -113,6 +147,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=161,
                 description="สามารถอ่านข้อมูลระบบ/รุ่นอุปกรณ์ผ่าน SNMP v1/v2c ด้วยรหัส 'public' ได้",
                 remediation="เปลี่ยน Community String จาก 'public' เป็นค่าที่เดายาก อัปเกรดเป็น SNMPv3 หรือจำกัด IP",
+                cve_ids=["CVE-2002-0013", "CWE-287"],
             )
         )
 
@@ -127,6 +162,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=db_port,
                     description=f"พอร์ต {db_port} ({banner}) เปิดรับการเชื่อมต่อจากเครื่องอื่นในวงแลน",
                     remediation="ตั้งค่า Bind Address เป็น 127.0.0.1 หากใช้เฉพาะในเครื่อง หรือตั้ง Firewall จำกัดเฉพาะ IP ที่อนุญาต",
+                    cve_ids=["CWE-284"],
                 )
             )
             if db_port == 5432 and "no ssl" in banner.lower():
@@ -137,6 +173,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                         port=5432,
                         description="เซิร์ฟเวอร์ตอบกลับ 'No SSL' เมื่อร้องขอการเชื่อมต่อแบบเข้ารหัส",
                         remediation="เปิดใช้งาน `ssl = on` ในไฟล์ postgresql.conf",
+                        cve_ids=["CWE-319"],
                     )
                 )
 
@@ -149,6 +186,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=1883,
                 description="พอร์ต 1883 ส่งข้อมูลอุปกรณ์ IoT แบบไม่เข้ารหัส TLS และอาจเปิดรับคำสั่งโดยไม่ยืนยันตัวตน",
                 remediation="เปิดใช้ Username/Password และเปลี่ยนไปใช้ MQTTS (Port 8883)",
+                cve_ids=["CWE-319", "CWE-306"],
             )
         )
 
@@ -167,6 +205,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=445,
                     description="รายการที่มองเห็น: " + ", ".join(non_default_shares[:8]),
                     remediation="ตรวจสอบสิทธิ์การแชร์ (Share & NTFS Permissions) ไม่ให้สิทธิ์ Everyone เขียน/อ่านข้อมูลสำคัญ",
+                    cve_ids=["CWE-732"],
                 )
             )
         else:
@@ -188,6 +227,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=139,
                 description="พอร์ต 139 เป็นโปรโตคอลเก่าที่ใช้ร่วมกับการแชร์ไฟล์และมักถูกใช้สืบค้นชื่อเครื่อง",
                 remediation="พิจารณาปิด 'NetBIOS over TCP/IP' ในตั้งค่า TCP/IPv4 หากระบบใช้ SMB 445 ได้ปกติ",
+                cve_ids=["CWE-200"],
             )
         )
 
@@ -200,24 +240,51 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                 port=3389,
                 description="เครื่องเปิดรับการรีโมตหน้าจอ RDP ในวงแลน",
                 remediation="เปิดใช้ Network Level Authentication (NLA) ตั้งรหัสผ่านให้รัดกุม และจำกัด IP ที่รีโมตได้",
+                cve_ids=["CWE-284"],
             )
         )
 
-    # 9. HTTP unencrypted web management vs HTTPS
+    # 9. HTTP unencrypted web management & Web Server Banner CVEs
     has_https = bool(ports & {443, 8443, 5001})
-    for hp in (80, 8080, 8000, 5000):
-        if hp in ports:
-            banner = res.port_banners.get(hp, "")
-            if not has_https:
-                findings.append(
-                    VulnFinding(
-                        severity="LOW",
-                        title=f"เว็บจัดการอุปกรณ์ทำงานบน HTTP ไม่เข้ารหัส (Port {hp})",
-                        port=hp,
-                        description=f"พบเว็บเซิร์ฟเวอร์ ({banner or 'HTTP'}) โดยไม่มีพอร์ต HTTPS รองรับ",
-                        remediation="หลีกเลี่ยงการล็อกอินผ่านเครือข่ายที่ไม่น่าเชื่อถือ หรือเปิดใช้ HTTPS หากอุปกรณ์รองรับ",
-                    )
+    for hp in (80, 443, 8080, 8443, 8000, 5000):
+        if hp not in ports:
+            continue
+        banner = res.port_banners.get(hp, "")
+        b_low = banner.lower()
+        if "apache/2.4.49" in b_low or "apache/2.4.50" in b_low:
+            findings.append(
+                VulnFinding(
+                    severity="CRITICAL",
+                    title=f"Apache HTTP Server เวอร์ชันเสี่ยง Path Traversal / RCE (Port {hp})",
+                    port=hp,
+                    description=f"ตรวจพบ Banner: {banner}",
+                    remediation="อัปเดต Apache HTTP Server เป็นเวอร์ชัน 2.4.51 ขึ้นไปทันที",
+                    cve_ids=["CVE-2021-41773", "CVE-2021-42013"],
                 )
+            )
+        elif "microsoft-iis/7." in b_low or "microsoft-iis/8." in b_low:
+            findings.append(
+                VulnFinding(
+                    severity="MEDIUM",
+                    title=f"ตรวจพบ Microsoft IIS รุ่นเก่า (Port {hp})",
+                    port=hp,
+                    description=f"ตรวจพบ Banner: {banner} (ควรตรวจสอบสถานะแพตช์ HTTP.sys)",
+                    remediation="อัปเกรดระบบปฏิบัติการ/IIS และตรวจสอบการติดตั้งแพตช์ MS15-034",
+                    cve_ids=["CVE-2015-1635"],
+                )
+            )
+
+        if hp in (80, 8080, 8000, 5000) and not has_https:
+            findings.append(
+                VulnFinding(
+                    severity="LOW",
+                    title=f"เว็บจัดการอุปกรณ์ทำงานบน HTTP ไม่เข้ารหัส (Port {hp})",
+                    port=hp,
+                    description=f"พบเว็บเซิร์ฟเวอร์ ({banner or 'HTTP'}) โดยไม่มีพอร์ต HTTPS รองรับ",
+                    remediation="หลีกเลี่ยงการล็อกอินผ่านเครือข่ายที่ไม่น่าเชื่อถือ หรือเปิดใช้ HTTPS หากอุปกรณ์รองรับ",
+                    cve_ids=["CWE-319"],
+                )
+            )
 
     # 10. SSL/TLS Certificate checks
     today_str = date.today().isoformat()
@@ -234,6 +301,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=c_port,
                     description=f"Certificate ({subj}) หมดอายุเมื่อ {exp}",
                     remediation="ต่ออายุหรือสร้างใบรับรอง SSL/TLS ใหม่บนอุปกรณ์/เซิร์ฟเวอร์",
+                    cve_ids=["CWE-298"],
                 )
             )
         elif subj and iss and subj == iss:
@@ -244,22 +312,41 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
                     port=c_port,
                     description=f"Subject และ Issuer เป็นชื่อเดียวกัน ({subj})",
                     remediation="สำหรับระบบภายในใช้งานได้ปกติ แต่หากเป็นระบบสำคัญควรใช้ Internal CA หรือ Let's Encrypt",
+                    cve_ids=["CWE-295"],
                 )
             )
 
-    # 11. SSH legacy version check
+    # 11. OpenSSH Banner CVE matching
     ssh_b = res.port_banners.get(22, "")
     if ssh_b:
-        if any(old in ssh_b for old in ("OpenSSH_4.", "OpenSSH_5.", "OpenSSH_6.", "OpenSSH_7.0", "OpenSSH_7.2")):
-            findings.append(
-                VulnFinding(
-                    severity="LOW",
-                    title="เวอร์ชัน SSH Server ค่อนข้างเก่า",
-                    port=22,
-                    description=f"ตรวจพบ Banner: {ssh_b}",
-                    remediation="อัปเดต OpenSSH / Firmware อุปกรณ์ให้เป็นเวอร์ชันล่าสุด",
+        ssh_ver = _parse_openssh_version(ssh_b)
+        is_win_ssh = "windows" in ssh_b.lower()
+        if ssh_ver is not None:
+            if (8, 5) <= ssh_ver < (9, 8) and not is_win_ssh:
+                findings.append(
+                    VulnFinding(
+                        severity="HIGH",
+                        title="OpenSSH เวอร์ชันอยู่ในช่วงที่อาจมีช่องโหว่ regreSSHion / Terrapin",
+                        port=22,
+                        description=f"ตรวจพบ Banner: {ssh_b} (ควรตรวจสอบว่า OS ออกแพตช์ย้อนหลังแล้วหรือไม่)",
+                        remediation="อัปเดตแพ็กเกจ `openssh-server` เป็นเวอร์ชันล่าสุด หรือจำกัด IP ที่เข้าพอร์ต 22",
+                        cve_ids=["CVE-2024-6387 (regreSSHion)", "CVE-2023-48795 (Terrapin)"],
+                    )
                 )
-            )
+            elif ssh_ver < (8, 5):
+                cves = ["CVE-2023-48795 (Terrapin)"]
+                if ssh_ver < (7, 4):
+                    cves.extend(["CVE-2016-10009", "CVE-2016-10012"])
+                findings.append(
+                    VulnFinding(
+                        severity="MEDIUM" if ssh_ver < (7, 4) else "LOW",
+                        title="OpenSSH Server เป็นเวอร์ชันเก่า",
+                        port=22,
+                        description=f"ตรวจพบ Banner: {ssh_b}",
+                        remediation="อัปเดต OpenSSH / Firmware อุปกรณ์ให้เป็นเวอร์ชันล่าสุด",
+                        cve_ids=cves,
+                    )
+                )
 
     # 12. RTSP Camera stream
     if 554 in ports:
