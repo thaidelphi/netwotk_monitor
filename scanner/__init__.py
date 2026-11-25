@@ -11,6 +11,7 @@ from .network_utils import (
     parse_ports,
 )
 from .oui_db import lookup_mac_vendor
+from .vuln_audit import VulnFinding, audit_host_vulnerabilities
 
 __all__ = [
     "COMMON_PORTS",
@@ -19,6 +20,8 @@ __all__ = [
     "LanScannerEngine",
     "NetworkInterface",
     "ScanConfig",
+    "VulnFinding",
+    "audit_host_vulnerabilities",
     "detect_network_interfaces",
     "ip_to_int",
     "lookup_mac_vendor",

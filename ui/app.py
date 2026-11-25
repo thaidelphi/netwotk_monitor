@@ -22,6 +22,8 @@ from scanner import (
     LanScannerEngine,
     NetworkInterface,
     ScanConfig,
+    VulnFinding,
+    audit_host_vulnerabilities,
     detect_network_interfaces,
     ip_to_int,
     parse_ip_range,
@@ -83,6 +85,7 @@ class LanScannerApp:
         self.sort_col: str = "ip"
         self.sort_desc: bool = False
         self.last_elapsed_sec: float = 0.0
+        self._pending_vuln_audit_ip: str | None = None
 
         # Tkinter Variables
         self.adapter_var = tk.StringVar()
@@ -496,6 +499,13 @@ class LanScannerApp:
             fg="#0F172A",
             font=("Segoe UI", 11, "bold"),
         ).pack(side="left")
+        self.btn_vuln_audit = ttk.Button(
+            insp_hdr,
+            text="🛡️ ตรวจช่องโหว่",
+            style="Soft.TButton",
+            command=self.audit_selected_host,
+        )
+        self.btn_vuln_audit.pack(side="right", padx=(0, 6))
         self.btn_deep_inspect = ttk.Button(
             insp_hdr,
             text="🔍 เจาะลึกเครื่องนี้",
@@ -608,6 +618,7 @@ class LanScannerApp:
 
         # Right-click Context Menu
         self.ctx_menu = tk.Menu(self.root, tearoff=0, font=("Segoe UI", 9))
+        self.ctx_menu.add_command(label="🛡️ ตรวจสอบช่องโหว่เครื่องนี้ (Vulnerability Audit)", command=self.audit_selected_host)
         self.ctx_menu.add_command(label="🔍 เจาะลึกเครื่องนี้ (สแกนพอร์ตเพิ่ม + ตรวจ OS)", command=self.deep_inspect_selected_host)
         self.ctx_menu.add_command(label="สแกนเครื่องนี้ซ้ำอีกครั้ง", command=self.rescan_selected_host)
         self.ctx_menu.add_separator()
@@ -844,6 +855,138 @@ class LanScannerApp:
         )
         worker.start()
 
+    def audit_selected_host(self) -> None:
+        """Run deep inspection if needed, then display a defensive vulnerability audit report."""
+        if self.engine.is_running:
+            return
+        res = self._get_selected_result()
+        if not res:
+            messagebox.showinfo("เลือกเครื่องก่อน", "กรุณาคลิกเลือกเครื่องในตารางที่ต้องการตรวจสอบช่องโหว่", parent=self.root)
+            return
+        if not res.deep_inspected and res.online:
+            self._pending_vuln_audit_ip = res.ip
+            self.deep_inspect_selected_host()
+            return
+        findings = audit_host_vulnerabilities(res)
+        self._show_vuln_report_window(res, findings)
+
+    def _show_vuln_report_window(self, res: HostScanResult, findings: list[VulnFinding]) -> None:
+        """Open a dedicated structured Vulnerability Audit Report dialog for the selected device."""
+        win = tk.Toplevel(self.root)
+        win.title(f"รายงานตรวจสอบช่องโหว่ — {res.ip}")
+        win.geometry("760x560")
+        win.minsize(620, 440)
+        win.configure(bg="#F1F5F9")
+        win.transient(self.root)
+
+        hdr = tk.Frame(win, bg="#0F172A", padx=16, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text=f"🛡️ รายงานตรวจสอบช่องโหว่และความปลอดภัย: {res.ip}",
+            bg="#0F172A",
+            fg="#F8FAFC",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=f"ชื่อเครื่อง: {res.hostname}  •  OS: {res.os_name}  •  MAC: {res.mac} ({res.vendor})",
+            bg="#0F172A",
+            fg="#94A3B8",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Severity summary bar
+        counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        badge_colors = {
+            "CRITICAL": ("#FEE2E2", "#991B1B"),
+            "HIGH": ("#FFEDD5", "#9A3412"),
+            "MEDIUM": ("#FEF3C7", "#92400E"),
+            "LOW": ("#E0F2FE", "#075985"),
+            "INFO": ("#F1F5F9", "#334155"),
+        }
+        sum_bar = tk.Frame(win, bg="#FFFFFF", padx=14, pady=8)
+        sum_bar.pack(fill="x")
+        for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+            bg_c, fg_c = badge_colors[sev]
+            tk.Label(
+                sum_bar,
+                text=f" {sev}: {counts[sev]} ",
+                bg=bg_c,
+                fg=fg_c,
+                font=("Segoe UI", 9, "bold"),
+                padx=8,
+                pady=3,
+            ).pack(side="left", padx=(0, 8))
+
+        txt_outer = tk.Frame(win, bg="#CBD5E1", padx=1, pady=1)
+        txt_outer.pack(fill="both", expand=True, padx=14, pady=10)
+        txt = tk.Text(
+            txt_outer,
+            bg="#FFFFFF",
+            fg="#0F172A",
+            font=("Segoe UI", 10),
+            wrap="word",
+            padx=14,
+            pady=12,
+            relief="flat",
+        )
+        vsb = ttk.Scrollbar(txt_outer, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_configure("CRITICAL", foreground="#B91C1C", font=("Segoe UI", 10, "bold"))
+        txt.tag_configure("HIGH", foreground="#C2410C", font=("Segoe UI", 10, "bold"))
+        txt.tag_configure("MEDIUM", foreground="#B45309", font=("Segoe UI", 10, "bold"))
+        txt.tag_configure("LOW", foreground="#0369A1", font=("Segoe UI", 10, "bold"))
+        txt.tag_configure("INFO", foreground="#475569", font=("Segoe UI", 10, "bold"))
+        txt.tag_configure("remedy", foreground="#065F46", font=("Segoe UI", 9, "bold"))
+        txt.tag_configure("body", foreground="#1E293B", font=("Segoe UI", 9))
+
+        plain_report: list[str] = [
+            f"รายงานตรวจสอบช่องโหว่: {res.ip} ({res.hostname})",
+            f"OS: {res.os_name} | MAC: {res.mac} | Vendor: {res.vendor}",
+            f"Open Ports: {res.ports_display}",
+            "=" * 60,
+        ]
+        for idx, f in enumerate(findings, 1):
+            port_tag = f" (Port {f.port})" if f.port else ""
+            header_line = f"{idx}. [{f.severity}] {f.title}{port_tag}\n"
+            txt.insert("end", header_line, f.severity)
+            txt.insert("end", f"   รายละเอียด: {f.description}\n", "body")
+            txt.insert("end", f"   แนวทางแก้ไข: {f.remediation}\n\n", "remedy")
+            plain_report.extend(
+                [
+                    header_line.strip(),
+                    f"   รายละเอียด: {f.description}",
+                    f"   แนวทางแก้ไข: {f.remediation}",
+                    "",
+                ]
+            )
+        txt.configure(state="disabled")
+
+        btn_bar = ttk.Frame(win, style="Surface.TFrame", padding=(14, 0, 14, 12))
+        btn_bar.pack(fill="x")
+
+        def _save_report() -> None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="บันทึกรายงานตรวจสอบช่องโหว่",
+                defaultextension=".txt",
+                initialfile=f"vuln_audit_{res.ip}_{stamp}.txt",
+                filetypes=[("Text Report", "*.txt"), ("All Files", "*.*")],
+            )
+            if path:
+                Path(path).write_text("\n".join(plain_report), encoding="utf-8")
+                self.status_text_var.set(f"บันทึกรายงานช่องโหว่เรียบร้อย: {path}")
+
+        ttk.Button(btn_bar, text="บันทึกรายงาน (.txt)", style="Primary.TButton", command=_save_report).pack(
+            side="left"
+        )
+        ttk.Button(btn_bar, text="ปิดหน้าต่าง", style="Soft.TButton", command=win.destroy).pack(side="right")
+
     def _scan_worker_thread(self, config: ScanConfig, is_single_rescan: bool) -> None:
         def on_host_done(res: HostScanResult, done_count: int, total_count: int) -> None:
             self.event_queue.put(("host", res, done_count, total_count, is_single_rescan))
@@ -907,6 +1050,12 @@ class LanScannerApp:
             else:
                 self.status_text_var.set(f"อัปเดตสถานะเครื่องเรียบร้อย ({elapsed:.1f} วินาที)")
                 self._on_row_selected()
+                if self._pending_vuln_audit_ip:
+                    pending_ip = self._pending_vuln_audit_ip
+                    self._pending_vuln_audit_ip = None
+                    audited_res = self.results_by_ip.get(pending_ip)
+                    if audited_res:
+                        self._show_vuln_report_window(audited_res, audit_host_vulnerabilities(audited_res))
 
         self.root.after(60, self._poll_queue)
 
@@ -914,6 +1063,7 @@ class LanScannerApp:
         self.btn_start.configure(state="disabled" if scanning else "normal")
         self.btn_stop.configure(state="normal" if scanning else "disabled")
         self.btn_deep_inspect.configure(state="disabled" if scanning else "normal")
+        self.btn_vuln_audit.configure(state="disabled" if scanning else "normal")
         self.ent_start_ip.configure(state="disabled" if scanning else "normal")
         self.ent_end_ip.configure(state="disabled" if scanning else "normal")
         self.cmb_adapter.configure(state="disabled" if scanning else "readonly")
