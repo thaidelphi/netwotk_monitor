@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import html
 import json
 import os
 import queue
@@ -28,6 +29,7 @@ from scanner import (
     ip_to_int,
     parse_ip_range,
     parse_ports,
+    summarize_host_risk,
 )
 
 SPEED_PROFILES: dict[str, tuple[int, int, float]] = {
@@ -56,6 +58,7 @@ class LanScannerApp:
         "ip",
         "hostname",
         "os",
+        "risk",
         "latency",
         "mac",
         "vendor",
@@ -86,6 +89,7 @@ class LanScannerApp:
         self.sort_desc: bool = False
         self.last_elapsed_sec: float = 0.0
         self._pending_vuln_audit_ip: str | None = None
+        self._is_va_scan_mode: bool = False
 
         # Tkinter Variables
         self.adapter_var = tk.StringVar()
@@ -263,6 +267,10 @@ class LanScannerApp:
 
         export_box = tk.Frame(header, bg="#0F172A")
         export_box.pack(side="right")
+        self.btn_va_summary = ttk.Button(
+            export_box, text="📊 สรุปผล VA", style="Soft.TButton", command=self.show_va_dashboard
+        )
+        self.btn_va_summary.pack(side="left", padx=(0, 8))
         self.btn_export_csv = ttk.Button(
             export_box, text="บันทึก CSV (Excel)", style="Soft.TButton", command=self.export_csv
         )
@@ -340,9 +348,13 @@ class LanScannerApp:
         action_box = ttk.Frame(cfg_card, style="Card.TFrame")
         action_box.grid(row=1, column=3, columnspan=2, sticky="e", pady=(0, 8))
         self.btn_start = ttk.Button(
-            action_box, text="▶ เริ่มสแกน (Start Scan)", style="Primary.TButton", command=self.start_scan
+            action_box, text="▶ เริ่มสแกน", style="Primary.TButton", command=self.start_scan
         )
-        self.btn_start.pack(side="left", padx=(0, 8))
+        self.btn_start.pack(side="left", padx=(0, 6))
+        self.btn_va_scan = ttk.Button(
+            action_box, text="🛡️ VA Scan ทั้งวง", style="Soft.TButton", command=self.start_va_scan
+        )
+        self.btn_va_scan.pack(side="left", padx=(0, 6))
         self.btn_stop = ttk.Button(
             action_box, text="■ หยุด", style="Danger.TButton", command=self.stop_scan, state="disabled"
         )
@@ -465,13 +477,14 @@ class LanScannerApp:
         self._headings_meta: dict[str, tuple[str, int, str]] = {
             "status": ("สถานะ", 88, "center"),
             "ip": ("IP Address", 120, "w"),
-            "hostname": ("ชื่อเครื่อง (Hostname)", 165, "w"),
-            "os": ("ระบบปฏิบัติการ (OS)", 185, "w"),
-            "latency": ("Ping", 85, "center"),
-            "mac": ("MAC Address", 135, "center"),
-            "vendor": ("ยี่ห้ออุปกรณ์ (Vendor)", 165, "w"),
-            "device_type": ("ประเภทอุปกรณ์", 135, "w"),
-            "ports": ("พอร์ตที่เปิด (Open Ports)", 210, "w"),
+            "hostname": ("ชื่อเครื่อง (Hostname)", 160, "w"),
+            "os": ("ระบบปฏิบัติการ (OS)", 175, "w"),
+            "risk": ("ความเสี่ยง VA", 118, "center"),
+            "latency": ("Ping", 82, "center"),
+            "mac": ("MAC Address", 132, "center"),
+            "vendor": ("ยี่ห้ออุปกรณ์ (Vendor)", 155, "w"),
+            "device_type": ("ประเภทอุปกรณ์", 130, "w"),
+            "ports": ("พอร์ตที่เปิด (Open Ports)", 200, "w"),
         }
         for col_id, (label, width, anchor) in self._headings_meta.items():
             self.tree.heading(col_id, text=label, command=lambda c=col_id: self.sort_by_column(c))
@@ -483,6 +496,9 @@ class LanScannerApp:
         self.tree.tag_configure("online_odd", background="#F8FAFC", foreground="#0F172A")
         self.tree.tag_configure("local_pc", background="#ECFDF5", foreground="#065F46")
         self.tree.tag_configure("offline_row", background="#FAFAFA", foreground="#94A3B8")
+        self.tree.tag_configure("risk_critical", background="#FEF2F2", foreground="#991B1B")
+        self.tree.tag_configure("risk_high", background="#FFF7ED", foreground="#9A3412")
+        self.tree.tag_configure("risk_medium", background="#FFFBEB", foreground="#92400E")
 
         # 6. Right Pane: Rich Device Detail Inspector
         insp_outer = tk.Frame(paned, bg="#CBD5E1", padx=1, pady=1)
@@ -779,6 +795,7 @@ class LanScannerApp:
     def start_scan(self) -> None:
         if self.engine.is_running:
             return
+        self._is_va_scan_mode = False
         config = self._build_scan_config()
         if config is None:
             return
@@ -801,6 +818,69 @@ class LanScannerApp:
 
         self._set_scanning_ui_state(True)
 
+        worker = threading.Thread(
+            target=self._scan_worker_thread, args=(config, False), daemon=True
+        )
+        worker.start()
+
+    def start_va_scan(self) -> None:
+        """Run a full Vulnerability Assessment (VA) Scan across online hosts or the full IP range."""
+        if self.engine.is_running:
+            return
+
+        online_ips = [r.ip for r in self.results_by_ip.values() if r.online]
+        all_ports = sorted(COMMON_PORTS.keys())
+
+        if online_ips:
+            online_ips.sort(key=ip_to_int)
+            config = ScanConfig(
+                target_ips=online_ips,
+                scan_ports=True,
+                ports=all_ports,
+                ping_timeout_ms=800,
+                port_timeout_sec=0.4,
+                max_workers=32,
+                resolve_hostname=True,
+                deep_inspect=True,
+                local_interfaces=self.interfaces,
+            )
+            self._is_va_scan_mode = True
+            self.progress_var.set(0.0)
+            self.stat_time_var.set("กำลังทำ VA...")
+            self.status_text_var.set(
+                f"กำลังทำ VA Scan ({len(online_ips)} เครื่องออนไลน์ × {len(all_ports)} พอร์ต + ตรวจช่องโหว่)..."
+            )
+        else:
+            base_cfg = self._build_scan_config()
+            if base_cfg is None:
+                return
+            self.results_by_ip.clear()
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            total = len(base_cfg.target_ips)
+            self.stat_total_var.set(f"{total:,}")
+            self.stat_online_var.set("0")
+            self.stat_offline_var.set("0")
+            self.stat_ports_var.set("0")
+            self.stat_time_var.set("กำลังทำ VA...")
+            self.progress_var.set(0.0)
+            config = ScanConfig(
+                target_ips=base_cfg.target_ips,
+                scan_ports=True,
+                ports=all_ports,
+                ping_timeout_ms=base_cfg.ping_timeout_ms,
+                port_timeout_sec=max(0.35, base_cfg.port_timeout_sec),
+                max_workers=min(64, base_cfg.max_workers),
+                resolve_hostname=True,
+                deep_inspect=True,
+                local_interfaces=self.interfaces,
+            )
+            self._is_va_scan_mode = True
+            self.status_text_var.set(
+                f"กำลังทำ VA Scan ทั้งช่วง {config.target_ips[0]} - {config.target_ips[-1]} ({total:,} IP)..."
+            )
+
+        self._set_scanning_ui_state(True)
         worker = threading.Thread(
             target=self._scan_worker_thread, args=(config, False), daemon=True
         )
@@ -993,6 +1073,197 @@ class LanScannerApp:
         )
         ttk.Button(btn_bar, text="ปิดหน้าต่าง", style="Soft.TButton", command=win.destroy).pack(side="right")
 
+    def show_va_dashboard(self) -> None:
+        """Open the subnet-wide Vulnerability Assessment (VA) Dashboard with HTML report export."""
+        online_hosts = [r for r in self.results_by_ip.values() if r.online]
+        if not online_hosts:
+            messagebox.showinfo(
+                "ยังไม่มีข้อมูลสำหรับ VA",
+                "กรุณากด '🛡️ VA Scan ทั้งวง' หรือสแกนเครือข่ายก่อนดูรายงานสรุปผล VA",
+                parent=self.root,
+            )
+            return
+
+        host_audits: list[tuple[HostScanResult, list[VulnFinding], str, int, dict[str, int]]] = []
+        totals = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for r in online_hosts:
+            findings = audit_host_vulnerabilities(r)
+            r_label, r_score, counts = summarize_host_risk(findings)
+            r.risk_label = r_label
+            r.risk_score = r_score
+            for sev in totals:
+                totals[sev] += counts[sev]
+            host_audits.append((r, findings, r_label, r_score, counts))
+
+        host_audits.sort(key=lambda item: (-item[3], ip_to_int(item[0].ip)))
+        self.refresh_table_view()
+
+        win = tk.Toplevel(self.root)
+        win.title("VA Scan Dashboard — รายงานประเมินช่องโหว่ทั้งวงแลน")
+        win.geometry("920x620")
+        win.minsize(760, 480)
+        win.configure(bg="#F1F5F9")
+        win.transient(self.root)
+
+        hdr = tk.Frame(win, bg="#0F172A", padx=18, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text="🛡️ Vulnerability Assessment (VA Scan) Dashboard",
+            bg="#0F172A",
+            fg="#F8FAFC",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=f"สรุปผลการประเมินความเสี่ยงอุปกรณ์ออนไลน์ทั้งหมด {len(online_hosts)} เครื่อง • ดับเบิลคลิกที่แถวเพื่อดูรายละเอียดช่องโหว่และวิธีแก้ไข",
+            bg="#0F172A",
+            fg="#94A3B8",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Summary cards
+        cards = tk.Frame(win, bg="#F1F5F9", padx=14, pady=10)
+        cards.pack(fill="x")
+        for idx in range(5):
+            cards.columnconfigure(idx, weight=1)
+
+        card_meta = [
+            ("เครื่องที่ประเมิน", str(len(online_hosts)), "#0F172A"),
+            ("CRITICAL", str(totals["CRITICAL"]), "#DC2626"),
+            ("HIGH", str(totals["HIGH"]), "#EA580C"),
+            ("MEDIUM", str(totals["MEDIUM"]), "#D97706"),
+            ("LOW", str(totals["LOW"]), "#0284C7"),
+        ]
+        for idx, (lbl, val, color) in enumerate(card_meta):
+            b = tk.Frame(cards, bg="#CBD5E1", padx=1, pady=1)
+            b.grid(row=0, column=idx, sticky="ew", padx=(0, 8) if idx < 4 else (0, 0))
+            inner = tk.Frame(b, bg="#FFFFFF", padx=10, pady=8)
+            inner.pack(fill="both", expand=True)
+            tk.Label(inner, text=lbl, bg="#FFFFFF", fg="#64748B", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+            tk.Label(inner, text=val, bg="#FFFFFF", fg=color, font=("Segoe UI", 15, "bold")).pack(anchor="w")
+
+        # Hosts risk table
+        tbl_wrap = tk.Frame(win, bg="#CBD5E1", padx=1, pady=1)
+        tbl_wrap.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        tbl_frame = ttk.Frame(tbl_wrap, style="Card.TFrame")
+        tbl_frame.pack(fill="both", expand=True)
+        tbl_frame.rowconfigure(0, weight=1)
+        tbl_frame.columnconfigure(0, weight=1)
+
+        va_cols = ("ip", "hostname", "os", "risk", "score", "top_issue")
+        va_tree = ttk.Treeview(tbl_frame, columns=va_cols, show="headings", style="Scanner.Treeview")
+        va_tree.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(tbl_frame, orient="vertical", command=va_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        va_tree.configure(yscrollcommand=vsb.set)
+
+        for cid, title, w, anc in (
+            ("ip", "IP Address", 120, "w"),
+            ("hostname", "ชื่อเครื่อง", 155, "w"),
+            ("os", "ระบบปฏิบัติการ (OS)", 185, "w"),
+            ("risk", "ระดับความเสี่ยง", 120, "center"),
+            ("score", "คะแนนเสี่ยง", 90, "center"),
+            ("top_issue", "ประเด็นสำคัญที่พบ", 230, "w"),
+        ):
+            va_tree.heading(cid, text=title)
+            va_tree.column(cid, width=w, anchor=anc, stretch=(cid in ("os", "top_issue")))
+
+        va_tree.tag_configure("crit", background="#FEF2F2", foreground="#991B1B")
+        va_tree.tag_configure("high", background="#FFF7ED", foreground="#9A3412")
+        va_tree.tag_configure("med", background="#FFFBEB", foreground="#92400E")
+        va_tree.tag_configure("ok", background="#FFFFFF", foreground="#0F172A")
+
+        audit_map: dict[str, tuple[HostScanResult, list[VulnFinding]]] = {}
+        for r, findings, r_label, r_score, counts in host_audits:
+            audit_map[r.ip] = (r, findings)
+            top_f = findings[0].title if findings else "-"
+            tag = "crit" if counts["CRITICAL"] else ("high" if counts["HIGH"] else ("med" if counts["MEDIUM"] else "ok"))
+            va_tree.insert(
+                "",
+                "end",
+                iid=r.ip,
+                values=(r.ip, r.hostname, r.os_name, r_label, r_score, top_f),
+                tags=(tag,),
+            )
+
+        def _open_selected_host_report(_event: object = None) -> None:
+            sel = va_tree.selection()
+            if sel and sel[0] in audit_map:
+                h_res, h_findings = audit_map[sel[0]]
+                self._show_vuln_report_window(h_res, h_findings)
+
+        va_tree.bind("<Double-1>", _open_selected_host_report)
+
+        def _export_html_report() -> None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="บันทึกรายงาน VA Scan เป็นไฟล์ HTML",
+                defaultextension=".html",
+                initialfile=f"va_report_{stamp}.html",
+                filetypes=[("HTML Report", "*.html"), ("All Files", "*.*")],
+            )
+            if not path:
+                return
+            blocks: list[str] = []
+            for r, findings, r_label, r_score, _ in host_audits:
+                rows_html = []
+                for f in findings:
+                    cves = ", ".join(html.escape(c) for c in f.cve_ids) or "-"
+                    rows_html.append(
+                        f"<tr><td><span class='badge {f.severity}'>{f.severity}</span></td>"
+                        f"<td>{f.port or '-'}</td>"
+                        f"<td><b>{html.escape(f.title)}</b><br><small>{html.escape(f.description)}</small></td>"
+                        f"<td><code>{cves}</code></td>"
+                        f"<td>{html.escape(f.remediation)}</td></tr>"
+                    )
+                blocks.append(
+                    f"<div class='card'><h3>{html.escape(r.ip)} — {html.escape(r.hostname)} "
+                    f"({html.escape(r.os_name)}) | ความเสี่ยง: {html.escape(r_label)} (Score {r_score})</h3>"
+                    f"<p>MAC: {html.escape(r.mac)} ({html.escape(r.vendor)}) • Open Ports: {html.escape(r.ports_display)}</p>"
+                    f"<table><thead><tr><th>ระดับ</th><th>Port</th><th>รายละเอียด</th><th>CVE/CWE</th><th>แนวทางแก้ไข</th></tr></thead>"
+                    f"<tbody>{''.join(rows_html)}</tbody></table></div>"
+                )
+            html_doc = f"""<!DOCTYPE html>
+<html lang="th"><head><meta charset="utf-8"><title>VA Scan Report</title>
+<style>
+body{{font-family:'Segoe UI',sans-serif;background:#f1f5f9;color:#0f172a;margin:24px}}
+.hdr{{background:#0f172a;color:#fff;padding:18px 22px;border-radius:10px;margin-bottom:16px}}
+.summary{{display:flex;gap:12px;margin-bottom:16px}}
+.stat{{background:#fff;padding:12px 16px;border-radius:8px;border:1px solid #cbd5e1;flex:1}}
+.card{{background:#fff;padding:16px;border-radius:8px;border:1px solid #cbd5e1;margin-bottom:14px}}
+table{{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}}
+th,td{{border:1px solid #e2e8f0;padding:8px;text-align:left;vertical-align:top}}
+th{{background:#f8fafc}}
+.badge{{padding:2px 8px;border-radius:4px;font-weight:700;font-size:11px}}
+.CRITICAL{{background:#fee2e2;color:#991b1b}}.HIGH{{background:#ffedd5;color:#9a3412}}
+.MEDIUM{{background:#fef3c7;color:#92400e}}.LOW{{background:#e0f2fe;color:#075985}}.INFO{{background:#f1f5f9;color:#334155}}
+</style></head><body>
+<div class="hdr"><h2>Vulnerability Assessment (VA Scan) Report</h2>
+<div>สร้างเมื่อ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • อุปกรณ์ที่ตรวจสอบ: {len(online_hosts)} เครื่อง</div></div>
+<div class="summary">
+<div class="stat"><div>CRITICAL</div><h2>{totals['CRITICAL']}</h2></div>
+<div class="stat"><div>HIGH</div><h2>{totals['HIGH']}</h2></div>
+<div class="stat"><div>MEDIUM</div><h2>{totals['MEDIUM']}</h2></div>
+<div class="stat"><div>LOW</div><h2>{totals['LOW']}</h2></div>
+</div>
+{''.join(blocks)}
+</body></html>"""
+            Path(path).write_text(html_doc, encoding="utf-8")
+            self.status_text_var.set(f"บันทึกรายงาน VA HTML เรียบร้อย: {path}")
+            webbrowser.open(Path(path).as_uri())
+
+        btn_bar = ttk.Frame(win, style="Surface.TFrame", padding=(14, 0, 14, 12))
+        btn_bar.pack(fill="x")
+        ttk.Button(btn_bar, text="ดูรายละเอียดเครื่องที่เลือก", style="Primary.TButton", command=_open_selected_host_report).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(btn_bar, text="ส่งออกรายงาน VA (HTML)", style="Soft.TButton", command=_export_html_report).pack(
+            side="left"
+        )
+        ttk.Button(btn_bar, text="ปิดหน้าต่าง", style="Soft.TButton", command=win.destroy).pack(side="right")
+
     def _scan_worker_thread(self, config: ScanConfig, is_single_rescan: bool) -> None:
         def on_host_done(res: HostScanResult, done_count: int, total_count: int) -> None:
             self.event_queue.put(("host", res, done_count, total_count, is_single_rescan))
@@ -1017,6 +1288,10 @@ class LanScannerApp:
             kind = msg[0]
             if kind == "host":
                 _, res, done_count, total_count, is_single_rescan = msg
+                if res.online and (res.deep_inspected or self._is_va_scan_mode or res.open_ports):
+                    r_label, r_score, _ = summarize_host_risk(audit_host_vulnerabilities(res))
+                    res.risk_label = r_label
+                    res.risk_score = r_score
                 self.results_by_ip[res.ip] = res
                 batch_updated = True
                 if not is_single_rescan:
@@ -1050,9 +1325,19 @@ class LanScannerApp:
                     )
                 else:
                     self.progress_var.set(100.0)
-                    self.status_text_var.set(
-                        f"สแกนเสร็จสมบูรณ์ — พบเครื่องออนไลน์ {online_n:,} จาก {len(self.results_by_ip):,} IP ({elapsed:.1f} วินาที)"
-                    )
+                    if self._is_va_scan_mode:
+                        self._is_va_scan_mode = False
+                        high_risk_n = sum(
+                            1 for r in self.results_by_ip.values() if r.online and r.risk_score >= 20
+                        )
+                        self.status_text_var.set(
+                            f"VA Scan เสร็จสมบูรณ์ — ตรวจ {online_n:,} เครื่อง พบความเสี่ยงสูง/วิกฤต {high_risk_n:,} เครื่อง ({elapsed:.1f} วินาที)"
+                        )
+                        self.show_va_dashboard()
+                    else:
+                        self.status_text_var.set(
+                            f"สแกนเสร็จสมบูรณ์ — พบเครื่องออนไลน์ {online_n:,} จาก {len(self.results_by_ip):,} IP ({elapsed:.1f} วินาที)"
+                        )
             else:
                 self.status_text_var.set(f"อัปเดตสถานะเครื่องเรียบร้อย ({elapsed:.1f} วินาที)")
                 self._on_row_selected()
@@ -1067,6 +1352,7 @@ class LanScannerApp:
 
     def _set_scanning_ui_state(self, scanning: bool) -> None:
         self.btn_start.configure(state="disabled" if scanning else "normal")
+        self.btn_va_scan.configure(state="disabled" if scanning else "normal")
         self.btn_stop.configure(state="normal" if scanning else "disabled")
         self.btn_deep_inspect.configure(state="disabled" if scanning else "normal")
         self.btn_vuln_audit.configure(state="disabled" if scanning else "normal")
@@ -1095,6 +1381,8 @@ class LanScannerApp:
             return (0 if res.hostname != "-" else 1, res.hostname.lower(), ip_to_int(res.ip))
         if col == "os":
             return (0 if res.os_name != "-" else 1, res.os_name.lower(), ip_to_int(res.ip))
+        if col == "risk":
+            return (0 if res.online else 1, -res.risk_score, ip_to_int(res.ip))
         if col == "latency":
             val = res.latency_ms if (res.online and res.latency_ms is not None) else 999999
             return (val, ip_to_int(res.ip))
@@ -1161,6 +1449,12 @@ class LanScannerApp:
             status_str = "● Online" if res.online else "○ Offline"
             if not res.online:
                 tag = "offline_row"
+            elif res.risk_score >= 40:
+                tag = "risk_critical"
+            elif res.risk_score >= 20:
+                tag = "risk_high"
+            elif res.risk_score >= 8:
+                tag = "risk_medium"
             elif res.device_type.startswith("เครื่องนี้"):
                 tag = "local_pc"
             else:
@@ -1175,6 +1469,7 @@ class LanScannerApp:
                     res.ip,
                     res.hostname,
                     res.os_name,
+                    res.risk_label,
                     res.latency_text,
                     res.mac,
                     res.vendor,

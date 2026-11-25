@@ -11,7 +11,7 @@ from .network_utils import (
     parse_ports,
 )
 from .oui_db import lookup_mac_vendor
-from .vuln_audit import VulnFinding, audit_host_vulnerabilities
+from .vuln_audit import VulnFinding, audit_host_vulnerabilities, summarize_host_risk
 
 __all__ = [
     "COMMON_PORTS",
@@ -27,4 +27,5 @@ __all__ = [
     "lookup_mac_vendor",
     "parse_ip_range",
     "parse_ports",
+    "summarize_host_risk",
 ]

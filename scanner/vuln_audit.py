@@ -373,3 +373,31 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
 
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.port or 0))
     return findings
+
+
+def summarize_host_risk(findings: list[VulnFinding]) -> tuple[str, int, dict[str, int]]:
+    """
+    Compute (risk_badge_label, numeric_risk_score, severity_counts) for a host's VA findings.
+    """
+    counts = {sev: 0 for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+    for f in findings:
+        if f.severity in counts:
+            counts[f.severity] += 1
+
+    score = (
+        counts["CRITICAL"] * 40
+        + counts["HIGH"] * 20
+        + counts["MEDIUM"] * 8
+        + counts["LOW"] * 2
+    )
+    if counts["CRITICAL"] > 0:
+        label = f"CRITICAL ({counts['CRITICAL']})"
+    elif counts["HIGH"] > 0:
+        label = f"HIGH ({counts['HIGH']})"
+    elif counts["MEDIUM"] > 0:
+        label = f"MEDIUM ({counts['MEDIUM']})"
+    elif counts["LOW"] > 0:
+        label = f"LOW ({counts['LOW']})"
+    else:
+        label = "ปลอดภัย (OK)"
+    return label, score, counts

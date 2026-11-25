@@ -91,6 +91,8 @@ class HostScanResult:
     discovery_method: str = "-"
     ttl: int | None = None
     deep_inspected: bool = False
+    risk_label: str = "-"
+    risk_score: int = 0
 
     @property
     def ports_display(self) -> str:
