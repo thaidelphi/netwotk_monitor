@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import platform
 import re
 import socket
 import ssl
 import struct
+from datetime import datetime, timezone
 
 
 def _decode_utf16le(data: bytes) -> str:
@@ -208,9 +210,15 @@ def probe_ssh_banner(ip_str: str, port: int = 22, timeout: float = 0.4) -> str:
     return ""
 
 
-def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: float = 0.55) -> dict[str, str]:
-    """Fetch HTTP/HTTPS status, Server header, page <title>, and SSL cert Common Name."""
-    result: dict[str, str] = {}
+def probe_http_info(
+    ip_str: str,
+    port: int,
+    use_ssl: bool = False,
+    timeout: float = 0.55,
+    deep_checks: bool = False,
+) -> dict[str, str]:
+    """Fetch HTTP/HTTPS status, Server/Security headers, page <title>, TLS version/cipher, and SSL cert details."""
+    result: dict[str, str] = {"port": str(port), "scheme": "https" if use_ssl else "http"}
     req = (
         f"GET / HTTP/1.0\r\n"
         f"Host: {ip_str}\r\n"
@@ -229,6 +237,13 @@ def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: floa
             ctx.verify_mode = ssl.CERT_NONE
             conn = ctx.wrap_socket(raw_sock, server_hostname=ip_str)
             try:
+                result["tls_version"] = conn.version() or ""
+                c_info = conn.cipher()
+                if c_info:
+                    result["tls_cipher"] = c_info[0]
+            except Exception:
+                pass
+            try:
                 der_cert = conn.getpeercert(binary_form=True)
                 if der_cert:
                     from cryptography import x509
@@ -238,7 +253,22 @@ def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: floa
                     iss = cert_obj.issuer.rfc4514_string()
                     result["ssl_subject"] = subj[:100]
                     result["ssl_issuer"] = iss[:100]
-                    result["ssl_expires"] = cert_obj.not_valid_after_utc.strftime("%Y-%m-%d")
+                    exp_dt = cert_obj.not_valid_after_utc
+                    result["ssl_expires"] = exp_dt.strftime("%Y-%m-%d")
+                    result["ssl_days_left"] = str((exp_dt - datetime.now(timezone.utc)).days)
+                    try:
+                        pub_k = cert_obj.public_key()
+                        key_sz = getattr(pub_k, "key_size", None)
+                        if key_sz:
+                            result["ssl_key_bits"] = str(key_sz)
+                    except Exception:
+                        pass
+                    try:
+                        sig_alg = cert_obj.signature_hash_algorithm
+                        if sig_alg:
+                            result["ssl_sig_alg"] = sig_alg.name
+                    except Exception:
+                        pass
                     try:
                         san = cert_obj.extensions.get_extension_for_class(
                             x509.SubjectAlternativeName
@@ -257,7 +287,7 @@ def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: floa
             conn.sendall(req)
             chunks: list[bytes] = []
             total = 0
-            while total < 4096:
+            while total < 8192:
                 try:
                     chunk = conn.recv(1024)
                 except OSError:
@@ -281,22 +311,76 @@ def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: floa
     lines = hdr_part.splitlines()
     if lines:
         result["status"] = lines[0].strip()[:60]
+
+    sec_present: set[str] = set()
     for line in lines[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
             kl = k.strip().lower()
+            val = v.strip()
             if kl == "server":
-                result["server"] = v.strip()[:80]
+                result["server"] = val[:80]
             elif kl == "location":
-                result["location"] = v.strip()[:80]
+                result["location"] = val[:80]
             elif kl == "www-authenticate":
-                result["auth"] = v.strip()[:60]
+                result["auth"] = val[:60]
+            elif kl == "x-powered-by":
+                result["powered_by"] = val[:60]
+            elif kl in (
+                "strict-transport-security",
+                "x-frame-options",
+                "x-content-type-options",
+                "content-security-policy",
+            ):
+                sec_present.add(kl)
+
+    if result.get("status"):
+        missing = []
+        if use_ssl and "strict-transport-security" not in sec_present:
+            missing.append("HSTS")
+        if "x-frame-options" not in sec_present and "content-security-policy" not in sec_present:
+            missing.append("X-Frame-Options/CSP")
+        if "x-content-type-options" not in sec_present:
+            missing.append("X-Content-Type-Options")
+        if missing:
+            result["missing_sec_headers"] = ", ".join(missing)
 
     m = re.search(r"<title[^>]*>(.*?)</title>", body_part, re.IGNORECASE | re.DOTALL)
     if m:
         title = re.sub(r"\s+", " ", m.group(1)).strip()
         if title:
             result["title"] = title[:80]
+
+    if re.search(r"<title>\s*Index of /", body_part, re.IGNORECASE) or "Directory listing for /" in body_part:
+        result["dir_listing"] = "true"
+
+    if deep_checks and result.get("status"):
+        # Check OPTIONS allowed methods (detect TRACE / PUT / DELETE) and read-only /.git/HEAD exposure
+        def _send_http_raw(raw_req: str) -> str:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((ip_str, port))
+                if use_ssl:
+                    c2 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    c2.check_hostname = False
+                    c2.verify_mode = ssl.CERT_NONE
+                    s = c2.wrap_socket(s, server_hostname=ip_str)
+                with s:
+                    s.sendall(raw_req.encode("ascii"))
+                    return s.recv(1536).decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+
+        opt_resp = _send_http_raw(f"OPTIONS / HTTP/1.0\r\nHost: {ip_str}\r\nConnection: close\r\n\r\n")
+        for oline in opt_resp.splitlines():
+            if oline.lower().startswith("allow:"):
+                result["allow_methods"] = oline.split(":", 1)[1].strip()[:80]
+                break
+
+        git_resp = _send_http_raw(f"GET /.git/HEAD HTTP/1.0\r\nHost: {ip_str}\r\nConnection: close\r\n\r\n")
+        if "200 ok" in git_resp.lower() and "ref: refs/" in git_resp.lower():
+            result["git_exposed"] = "true"
 
     return result
 
@@ -426,6 +510,10 @@ def probe_rdp_ssl_cert(ip_str: str, port: int = 3389, timeout: float = 0.5) -> d
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with ctx.wrap_socket(raw, server_hostname=ip_str) as tls:
+            info["tls_version"] = tls.version() or ""
+            c_info = tls.cipher()
+            if c_info:
+                info["tls_cipher"] = c_info[0]
             der_cert = tls.getpeercert(binary_form=True)
             if der_cert:
                 from cryptography import x509
@@ -433,7 +521,15 @@ def probe_rdp_ssl_cert(ip_str: str, port: int = 3389, timeout: float = 0.5) -> d
                 cert_obj = x509.load_der_x509_certificate(der_cert)
                 info["ssl_subject"] = cert_obj.subject.rfc4514_string()[:100]
                 info["ssl_issuer"] = cert_obj.issuer.rfc4514_string()[:100]
-                info["ssl_expires"] = cert_obj.not_valid_after_utc.strftime("%Y-%m-%d")
+                exp_dt = cert_obj.not_valid_after_utc
+                info["ssl_expires"] = exp_dt.strftime("%Y-%m-%d")
+                info["ssl_days_left"] = str((exp_dt - datetime.now(timezone.utc)).days)
+                try:
+                    key_sz = getattr(cert_obj.public_key(), "key_size", None)
+                    if key_sz:
+                        info["ssl_key_bits"] = str(key_sz)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -592,9 +688,144 @@ def probe_postgres_banner(ip_str: str, port: int = 5432, timeout: float = 0.35) 
     return ""
 
 
+def probe_smbv1_enabled(ip_str: str, timeout: float = 0.45) -> bool:
+    """
+    Send a benign SMB1 Negotiate Protocol Request offering ONLY 'NT LM 0.12' dialect.
+    Returns True if server accepts SMBv1 (DialectIndex != 0xFFFF), False otherwise.
+    """
+    dialects = b"\x02NT LM 0.12\x00"
+    smb1_hdr = struct.pack(
+        "<4sIBBHH8sHHHHH",
+        b"\xffSMB",
+        0x72,  # SMB_COM_NEGOTIATE
+        0,     # Status
+        0x18,  # Flags
+        0xC853,  # Flags2
+        0,     # PIDHigh
+        b"\x00" * 8,  # SecurityFeatures
+        0,     # Reserved
+        0,     # TID
+        0xCAFE,  # PID
+        0,     # UID
+        1,     # MID
+    )
+    body = struct.pack("<BH", 0, len(dialects)) + dialects
+    pdu = smb1_hdr + body
+    pkt = struct.pack(">I", len(pdu)) + pdu
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, 445))
+            sock.sendall(pkt)
+            resp = sock.recv(512)
+        if len(resp) >= 39 and resp[4:8] == b"\xffSMB" and resp[8] == 0x72:
+            nt_status = struct.unpack_from("<I", resp, 9)[0]
+            dialect_idx = struct.unpack_from("<H", resp, 37)[0]
+            if nt_status == 0 and dialect_idx == 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def probe_docker_api(ip_str: str, port: int = 2375, timeout: float = 0.4) -> str:
+    """Check if unencrypted Docker Engine REST API responds on /version."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            sock.sendall(f"GET /version HTTP/1.0\r\nHost: {ip_str}\r\n\r\n".encode("ascii"))
+            resp = sock.recv(2048).decode("utf-8", errors="ignore")
+        if "200 ok" in resp.lower() and "apiversion" in resp.lower():
+            body = resp.split("\r\n\r\n", 1)[-1]
+            data = json.loads(body)
+            return f"Docker Engine {data.get('Version', '')} (API {data.get('ApiVersion', '')}) [No Auth!]"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_redis_banner(ip_str: str, port: int = 6379, timeout: float = 0.35) -> str:
+    """Send benign Redis PING command to identify exposed Redis & whether auth is required."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            sock.sendall(b"PING\r\n")
+            resp = sock.recv(128).decode("utf-8", errors="ignore").strip()
+        if resp.startswith("+PONG"):
+            return "Redis (+PONG — No Auth!)"
+        if "NOAUTH" in resp or "WRONGPASS" in resp:
+            return "Redis (Auth Required)"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_elasticsearch_banner(ip_str: str, port: int = 9200, timeout: float = 0.4) -> str:
+    """Read Elasticsearch root JSON cluster metadata."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            sock.sendall(f"GET / HTTP/1.0\r\nHost: {ip_str}\r\n\r\n".encode("ascii"))
+            resp = sock.recv(2048).decode("utf-8", errors="ignore")
+        if "200 ok" in resp.lower() and "cluster_name" in resp:
+            data = json.loads(resp.split("\r\n\r\n", 1)[-1])
+            ver = data.get("version", {}).get("number", "")
+            cname = data.get("cluster_name", "")
+            return f"Elasticsearch {ver} (cluster: {cname}) [No Auth!]"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_memcached_banner(ip_str: str, port: int = 11211, timeout: float = 0.35) -> str:
+    """Send Memcached 'version' command."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            sock.sendall(b"version\r\n")
+            resp = sock.recv(128).decode("utf-8", errors="ignore").strip()
+        if resp.startswith("VERSION "):
+            return f"Memcached {resp.split()[1]} [Exposed]"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_mdns_services(ip_str: str, timeout: float = 0.3) -> list[str]:
+    """Query _services._dns-sd._udp.local PTR via unicast UDP 5353 on target IP."""
+    labels = ["_services", "_dns-sd", "_udp", "local"]
+    qname = b"".join(bytes([len(l)]) + l.encode("ascii") for l in labels) + b"\x00"
+    pkt = struct.pack(">HHHHHH", 0x55AA, 0x0000, 1, 0, 0, 0) + qname + struct.pack(">HH", 12, 1)
+    services: list[str] = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(pkt, (ip_str, 5353))
+            resp, _ = sock.recvfrom(2048)
+        # Extract readable _xxx._tcp / _xxx._udp service tokens
+        for m in re.findall(rb"_[a-zA-Z0-9\-]{2,24}", resp):
+            tok = m.decode("ascii", errors="ignore")
+            if tok not in ("_services", "_dns-sd", "_udp", "_tcp") and tok not in services:
+                services.append(tok)
+    except Exception:
+        pass
+    return services[:12]
+
+
 def probe_snmp_sysinfo(ip_str: str, community: str = "public", timeout: float = 0.28) -> dict[str, str]:
     """Query SNMPv2c UDP 161 for sysDescr (1.1.0), sysUpTime (1.3.0), sysName (1.5.0)."""
-    oids = ("1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.5.0")
+    oids = (
+        "1.3.6.1.2.1.1.1.0",  # sysDescr
+        "1.3.6.1.2.1.1.3.0",  # sysUpTime
+        "1.3.6.1.2.1.1.4.0",  # sysContact
+        "1.3.6.1.2.1.1.5.0",  # sysName
+        "1.3.6.1.2.1.1.6.0",  # sysLocation
+        "1.3.6.1.2.1.2.1.0",  # ifNumber
+    )
     varbinds = b"".join(_ber_tlv(0x30, _encode_oid(o) + b"\x05\x00") for o in oids)
     req_id = 0x1234
     pdu = _ber_tlv(
@@ -644,8 +875,18 @@ def probe_snmp_sysinfo(ip_str: str, community: str = "public", timeout: float = 
                 hrs, rem = divmod(rem, 3600)
                 mins, _ = divmod(rem, 60)
                 info["uptime"] = f"{days} วัน {hrs} ชม. {mins} นาที" if days else f"{hrs} ชม. {mins} นาที"
+            elif oid_s == "1.3.6.1.2.1.1.4.0" and vtag == 0x04:
+                val_s = vraw.decode("utf-8", errors="ignore").strip()
+                if val_s:
+                    info["sys_contact"] = val_s[:80]
             elif oid_s == "1.3.6.1.2.1.1.5.0" and vtag == 0x04:
                 info["sys_name"] = vraw.decode("utf-8", errors="ignore").strip()[:80]
+            elif oid_s == "1.3.6.1.2.1.1.6.0" and vtag == 0x04:
+                val_s = vraw.decode("utf-8", errors="ignore").strip()
+                if val_s:
+                    info["sys_location"] = val_s[:80]
+            elif oid_s == "1.3.6.1.2.1.2.1.0" and vtag == 0x02:
+                info["if_count"] = str(int.from_bytes(vraw, "big", signed=True))
     except Exception:
         pass
 
@@ -782,8 +1023,11 @@ def collect_host_banners(
 
     if 445 in ports_set:
         smb_info = probe_smb_ntlm_os(ip_str, timeout=0.45 * timeout_scale)
+        if probe_udp_services and probe_smbv1_enabled(ip_str, timeout=0.45 * timeout_scale):
+            smb_info["smbv1_enabled"] = "true"
         if smb_info.get("os_guess"):
-            banners[445] = f"SMB2 ({smb_info['os_guess']})"
+            smbv1_tag = " [SMBv1 ON!]" if smb_info.get("smbv1_enabled") else ""
+            banners[445] = f"SMB2 ({smb_info['os_guess']}){smbv1_tag}"
         elif smb_info.get("target_name"):
             banners[445] = f"SMB2 ({smb_info['target_name']})"
 
@@ -792,10 +1036,22 @@ def collect_host_banners(
         if ssh_banner:
             banners[22] = ssh_banner
 
-    for hp in (80, 443, 8080, 8443, 8000, 5000, 5001):
+    http_port_map = (
+        (80, False), (81, False), (443, True), (3000, False), (4000, False),
+        (4443, True), (5000, False), (5001, True), (8000, False), (8006, True),
+        (8008, False), (8080, False), (8081, False), (8088, False), (8090, False),
+        (8181, False), (8443, True), (8888, False), (9000, False), (9090, False),
+        (9443, True), (10000, True),
+    )
+    for hp, use_ssl in http_port_map:
         if hp in ports_set:
-            use_ssl = hp in (443, 8443, 5001)
-            hinfo = probe_http_info(ip_str, hp, use_ssl=use_ssl, timeout=0.5 * timeout_scale)
+            hinfo = probe_http_info(
+                ip_str,
+                hp,
+                use_ssl=use_ssl,
+                timeout=0.5 * timeout_scale,
+                deep_checks=probe_udp_services,
+            )
             if hinfo:
                 http_infos.append(hinfo)
                 parts = []
@@ -803,12 +1059,14 @@ def collect_host_banners(
                     parts.append(hinfo["server"])
                 if hinfo.get("title"):
                     parts.append(f'"{hinfo["title"]}"')
+                if hinfo.get("tls_version"):
+                    parts.append(hinfo["tls_version"])
                 if not parts and hinfo.get("status"):
                     parts.append(hinfo["status"])
                 if parts:
                     banners[hp] = " | ".join(parts)
-                if hinfo.get("ssl_subject"):
-                    ssl_certs.append({"port": str(hp), **hinfo})
+                if hinfo.get("ssl_subject") or hinfo.get("tls_version"):
+                    ssl_certs.append(hinfo)
 
     if 554 in ports_set:
         rtsp_b = probe_rtsp_banner(ip_str, 554, timeout=0.4 * timeout_scale)
@@ -830,11 +1088,33 @@ def collect_host_banners(
         if vnc_b:
             banners[5900] = vnc_b
 
+    if 2375 in ports_set:
+        dk_b = probe_docker_api(ip_str, 2375, timeout=0.4 * timeout_scale)
+        if dk_b:
+            banners[2375] = dk_b
+
+    if 6379 in ports_set:
+        rd_b = probe_redis_banner(ip_str, 6379, timeout=0.35 * timeout_scale)
+        if rd_b:
+            banners[6379] = rd_b
+
+    if 9200 in ports_set:
+        es_b = probe_elasticsearch_banner(ip_str, 9200, timeout=0.4 * timeout_scale)
+        if es_b:
+            banners[9200] = es_b
+
+    if 11211 in ports_set:
+        mc_b = probe_memcached_banner(ip_str, 11211, timeout=0.35 * timeout_scale)
+        if mc_b:
+            banners[11211] = mc_b
+
     if 3389 in ports_set:
         rdp_cert = probe_rdp_ssl_cert(ip_str, 3389, timeout=0.5 * timeout_scale)
-        if rdp_cert.get("ssl_subject"):
+        if rdp_cert.get("ssl_subject") or rdp_cert.get("tls_version"):
             ssl_certs.append({"port": "3389", **rdp_cert})
-            banners[3389] = f"RDP TLS ({rdp_cert['ssl_subject']})"
+            subj = rdp_cert.get("ssl_subject", "RDP")
+            tls_v = rdp_cert.get("tls_version", "")
+            banners[3389] = f"RDP {tls_v} ({subj})".strip()
 
     for gp in (21, 23, 25, 110, 143):
         if gp in ports_set:
@@ -845,9 +1125,18 @@ def collect_host_banners(
     smb_shares: list[str] = []
     snmp_info: dict[str, str] = {}
     upnp_info: dict[str, str] = {}
+    mdns_services: list[str] = []
     if probe_udp_services:
-        snmp_info = probe_snmp_sysinfo(ip_str, timeout=0.32 * timeout_scale)
+        snmp_info = probe_snmp_sysinfo(ip_str, community="public", timeout=0.3 * timeout_scale)
+        if snmp_info:
+            snmp_info["community_public"] = "true"
+        priv_snmp = probe_snmp_sysinfo(ip_str, community="private", timeout=0.25 * timeout_scale)
+        if priv_snmp:
+            if not snmp_info:
+                snmp_info = priv_snmp
+            snmp_info["community_private"] = "true"
         upnp_info = probe_ssdp_upnp(ip_str, timeout=0.28 * timeout_scale)
+        mdns_services = probe_mdns_services(ip_str, timeout=0.28 * timeout_scale)
         if 445 in ports_set:
             smb_shares = probe_smb_shares(ip_str)
 
@@ -859,6 +1148,7 @@ def collect_host_banners(
         "ssl_certs": ssl_certs,
         "snmp": snmp_info,
         "upnp": upnp_info,
+        "mdns_services": mdns_services,
         "banners": banners,
     }
 

@@ -85,9 +85,11 @@ class HostScanResult:
     port_banners: dict[int, str] = field(default_factory=dict)
     smb_info: dict[str, str] = field(default_factory=dict)
     smb_shares: list[str] = field(default_factory=list)
+    http_infos: list[dict[str, str]] = field(default_factory=list)
     ssl_certs: list[dict[str, str]] = field(default_factory=list)
     snmp_info: dict[str, str] = field(default_factory=dict)
     upnp_info: dict[str, str] = field(default_factory=dict)
+    mdns_services: list[str] = field(default_factory=list)
     discovery_method: str = "-"
     ttl: int | None = None
     deep_inspected: bool = False
@@ -455,6 +457,56 @@ class LanScannerEngine:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _scan_ports_fast(
+        self,
+        ip_str: str,
+        ports: list[int],
+        timeout_sec: float,
+        pre_open_ports: set[int] | None = None,
+    ) -> tuple[list[int], int | None]:
+        """Scan TCP ports sequentially for tiny sets or concurrently via ThreadPool for 12+ ports."""
+        pre = pre_open_ports or set()
+        if not ports:
+            return [], None
+
+        if len(ports) <= 12:
+            open_list: list[int] = []
+            first_ms: int | None = None
+            for p in ports:
+                if self._stop_event.is_set():
+                    break
+                if p in pre:
+                    open_list.append(p)
+                    continue
+                is_open, c_ms = probe_tcp_port(ip_str, p, timeout=timeout_sec)
+                if is_open:
+                    open_list.append(p)
+                    if first_ms is None and c_ms is not None:
+                        first_ms = c_ms
+            return open_list, first_ms
+
+        open_set: set[int] = set(p for p in ports if p in pre)
+        to_probe = [p for p in ports if p not in pre]
+        first_ms: int | None = None
+        workers = min(48, max(8, len(to_probe)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="portscan") as p_pool:
+            fut_map = {
+                p_pool.submit(probe_tcp_port, ip_str, p, timeout_sec): p for p in to_probe
+            }
+            for fut in as_completed(fut_map):
+                if self._stop_event.is_set():
+                    break
+                p_num = fut_map[fut]
+                try:
+                    is_open, c_ms = fut.result()
+                except Exception:
+                    is_open, c_ms = False, None
+                if is_open:
+                    open_set.add(p_num)
+                    if first_ms is None and c_ms is not None:
+                        first_ms = c_ms
+        return sorted(open_set), first_ms
+
     def scan_single_host(
         self,
         ip_str: str,
@@ -473,14 +525,11 @@ class LanScannerEngine:
             local_name = socket.gethostname()
             open_ports: list[int] = []
             if config.scan_ports and config.ports:
-                for p in config.ports:
-                    if self._stop_event.is_set():
-                        break
-                    is_open, _ = probe_tcp_port(ip_str, p, timeout=0.15)
-                    if is_open:
-                        open_ports.append(p)
+                open_ports, _ = self._scan_ports_fast(ip_str, config.ports, timeout_sec=0.15)
             vendor = lookup_mac_vendor(iface.mac)
-            banner_data = collect_host_banners(ip_str, open_ports, timeout_scale=0.6)
+            banner_data = collect_host_banners(
+                ip_str, open_ports, timeout_scale=0.6, probe_udp_services=config.deep_inspect
+            )
             os_name, os_conf, os_ev = detect_os(
                 is_local_pc=True,
                 open_ports=open_ports,
@@ -506,8 +555,15 @@ class LanScannerEngine:
                 open_ports=open_ports,
                 port_banners=banner_data["banners"],  # type: ignore[arg-type]
                 smb_info=banner_data["smb"],  # type: ignore[arg-type]
+                smb_shares=banner_data["smb_shares"],  # type: ignore[arg-type]
+                http_infos=banner_data["http"],  # type: ignore[arg-type]
+                ssl_certs=banner_data["ssl_certs"],  # type: ignore[arg-type]
+                snmp_info=banner_data["snmp"],  # type: ignore[arg-type]
+                upnp_info=banner_data["upnp"],  # type: ignore[arg-type]
+                mdns_services=banner_data["mdns_services"],  # type: ignore[arg-type]
                 discovery_method="Local NIC",
                 ttl=128,
+                deep_inspected=config.deep_inspect,
             )
 
         # Determine if IP belongs to one of our directly-attached L2 subnets (where ARP works)
@@ -594,21 +650,18 @@ class LanScannerEngine:
                 if mdns_name:
                     hostname = mdns_name
 
-        # 5. Port Scan on alive host
+        # 5. Port Scan on alive host (parallelized for large port sets)
         open_ports_list: list[int] = []
         if config.scan_ports and config.ports and not self._stop_event.is_set():
-            for p in config.ports:
-                if self._stop_event.is_set():
-                    break
-                if p in pre_open_ports:
-                    open_ports_list.append(p)
-                    continue
-                is_open, c_ms = probe_tcp_port(ip_str, p, timeout=config.port_timeout_sec)
-                if is_open:
-                    open_ports_list.append(p)
-                    if latency_text == "Online (Firewall)" and c_ms is not None:
-                        latency_ms = c_ms
-                        latency_text = f"~{max(1, c_ms)} ms (TCP)"
+            open_ports_list, first_port_ms = self._scan_ports_fast(
+                ip_str,
+                config.ports,
+                timeout_sec=config.port_timeout_sec,
+                pre_open_ports=pre_open_ports,
+            )
+            if latency_text == "Online (Firewall)" and first_port_ms is not None:
+                latency_ms = first_port_ms
+                latency_text = f"~{max(1, first_port_ms)} ms (TCP)"
 
         final_mac = mac_addr if mac_addr else "-"
         vendor = lookup_mac_vendor(final_mac) if final_mac != "-" else "-"
@@ -622,6 +675,7 @@ class LanScannerEngine:
             "ssl_certs": [],
             "snmp": {},
             "upnp": {},
+            "mdns_services": [],
             "banners": {},
         }
         if (open_ports_list or config.deep_inspect) and not self._stop_event.is_set():
@@ -680,9 +734,11 @@ class LanScannerEngine:
             port_banners=banner_data["banners"],  # type: ignore[arg-type]
             smb_info=banner_data["smb"],  # type: ignore[arg-type]
             smb_shares=banner_data["smb_shares"],  # type: ignore[arg-type]
+            http_infos=banner_data["http"],  # type: ignore[arg-type]
             ssl_certs=banner_data["ssl_certs"],  # type: ignore[arg-type]
             snmp_info=banner_data["snmp"],  # type: ignore[arg-type]
             upnp_info=banner_data["upnp"],  # type: ignore[arg-type]
+            mdns_services=banner_data["mdns_services"],  # type: ignore[arg-type]
             discovery_method=discovery_method,
             ttl=ttl,
             deep_inspected=config.deep_inspect,

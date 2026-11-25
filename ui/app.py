@@ -830,6 +830,12 @@ class LanScannerApp:
 
         online_ips = [r.ip for r in self.results_by_ip.values() if r.online]
         all_ports = sorted(COMMON_PORTS.keys())
+        try:
+            custom_ports = parse_ports(self.ports_text_var.get()) if self.scan_ports_var.get() else []
+            if len(custom_ports) > len(all_ports):
+                all_ports = custom_ports
+        except Exception:
+            pass
 
         if online_ips:
             online_ips.sort(key=ip_to_int)
@@ -917,6 +923,12 @@ class LanScannerApp:
             messagebox.showinfo("เลือกเครื่องก่อน", "กรุณาคลิกเลือกเครื่องในตารางที่ต้องการเจาะลึก", parent=self.root)
             return
         all_ports = sorted(COMMON_PORTS.keys())
+        try:
+            custom_ports = parse_ports(self.ports_text_var.get()) if self.scan_ports_var.get() else []
+            if len(custom_ports) > len(all_ports):
+                all_ports = custom_ports
+        except Exception:
+            pass
         config = ScanConfig(
             target_ips=[res.ip],
             scan_ports=True,
@@ -1544,6 +1556,10 @@ th{{background:#f8fafc}}
             ):
                 if res.smb_info.get(k):
                     extra_smb.append(f"  {lbl}: {res.smb_info[k]}")
+            if res.smb_info.get("smbv1_enabled") == "true":
+                extra_smb.append("  SMBv1 Status: ENABLED (ไม่ปลอดภัย!)")
+            elif res.deep_inspected and 445 in res.open_ports:
+                extra_smb.append("  SMBv1 Status: Disabled (ปลอดภัย)")
             if extra_smb:
                 lines.append("\n[ข้อมูล SMB / Windows]")
                 lines.extend(extra_smb)
@@ -1555,20 +1571,56 @@ th{{background:#f8fafc}}
         if res.ssl_certs:
             lines.append("\n[ใบรับรองความปลอดภัย (SSL/TLS Cert)]")
             for c in res.ssl_certs:
-                lines.append(f"  Port {c.get('port', '')}: {c.get('ssl_subject', '-')}")
+                tls_v = c.get("tls_version", "")
+                cipher = c.get("tls_cipher", "")
+                bits = c.get("ssl_key_bits", "")
+                lines.append(
+                    f"  Port {c.get('port', '')}: {c.get('ssl_subject', '-')}"
+                    + (f" [{tls_v} / {cipher}]" if tls_v else "")
+                )
                 if c.get("ssl_san"):
                     lines.append(f"    SAN: {c['ssl_san']}")
                 if c.get("ssl_expires"):
-                    lines.append(f"    หมดอายุ: {c['ssl_expires']}")
+                    d_left = c.get("ssl_days_left", "")
+                    key_part = f" | Key {bits}-bit" if bits else ""
+                    left_part = f" (เหลือ {d_left} วัน)" if d_left else ""
+                    lines.append(f"    หมดอายุ: {c['ssl_expires']}{left_part}{key_part}")
+
+        if res.http_infos:
+            http_extra = []
+            for h in res.http_infos:
+                hp = h.get("port", "")
+                if h.get("powered_by"):
+                    http_extra.append(f"  Port {hp} X-Powered-By: {h['powered_by']}")
+                if h.get("allow_methods"):
+                    http_extra.append(f"  Port {hp} Methods: {h['allow_methods']}")
+                if h.get("missing_sec_headers"):
+                    http_extra.append(f"  Port {hp} ขาด Header: {h['missing_sec_headers']}")
+                if h.get("git_exposed") == "true":
+                    http_extra.append(f"  Port {hp} [ALERT]: เปิดเผย /.git/HEAD!")
+            if http_extra:
+                lines.append("\n[ตรวจสอบความปลอดภัย HTTP]")
+                lines.extend(http_extra)
 
         if res.snmp_info:
             lines.append("\n[ข้อมูลระบบ SNMP]")
+            comm_list = []
+            if res.snmp_info.get("community_public") == "true":
+                comm_list.append("public")
+            if res.snmp_info.get("community_private") == "true":
+                comm_list.append("private (R/W!)")
+            if comm_list:
+                lines.append(f"  Community ที่ตอบสนอง: {', '.join(comm_list)}")
             if res.snmp_info.get("sys_name"):
                 lines.append(f"  System Name: {res.snmp_info['sys_name']}")
             if res.snmp_info.get("sys_descr"):
                 lines.append(f"  Model/Desc: {res.snmp_info['sys_descr']}")
             if res.snmp_info.get("uptime"):
                 lines.append(f"  Uptime: {res.snmp_info['uptime']}")
+            if res.snmp_info.get("if_count"):
+                lines.append(f"  จำนวนพอร์ตเครือข่าย (Interfaces): {res.snmp_info['if_count']}")
+            if res.snmp_info.get("sys_location"):
+                lines.append(f"  Location: {res.snmp_info['sys_location']}")
             if res.snmp_info.get("printer_supplies"):
                 lines.append(f"  หมึก/วัสดุพิมพ์: {res.snmp_info['printer_supplies']}")
 
@@ -1583,6 +1635,10 @@ th{{background:#f8fafc}}
             ):
                 if res.upnp_info.get(k):
                     lines.append(f"  {lbl}: {res.upnp_info[k]}")
+
+        if res.mdns_services:
+            lines.append("\n[บริการที่ประกาศผ่าน mDNS / Bonjour]")
+            lines.append("  " + ", ".join(res.mdns_services))
 
         self.insp_ports_text.configure(state="normal")
         self.insp_ports_text.delete("1.0", "end")
@@ -1697,6 +1753,8 @@ th{{background:#f8fafc}}
                         "OS",
                         "OS Confidence",
                         "OS Evidence",
+                        "ความเสี่ยง VA",
+                        "คะแนนเสี่ยง",
                         "Ping",
                         "MAC Address",
                         "Vendor",
@@ -1718,6 +1776,8 @@ th{{background:#f8fafc}}
                             r.os_name,
                             r.os_confidence,
                             r.os_evidence,
+                            r.risk_label,
+                            r.risk_score,
                             r.latency_text,
                             r.mac,
                             r.vendor,
@@ -1759,6 +1819,8 @@ th{{background:#f8fafc}}
                     "os_name": r.os_name,
                     "os_confidence": r.os_confidence,
                     "os_evidence": r.os_evidence,
+                    "risk_label": r.risk_label,
+                    "risk_score": r.risk_score,
                     "latency_ms": r.latency_ms,
                     "latency_text": r.latency_text,
                     "mac": r.mac,
