@@ -834,6 +834,7 @@ class LanScannerApp:
             port_timeout_sec=0.45,
             max_workers=1,
             resolve_hostname=True,
+            deep_inspect=True,
             local_interfaces=self.interfaces,
         )
         self.status_text_var.set(f"กำลังเจาะลึก {res.ip} (สแกน {len(all_ports)} พอร์ต + ตรวจจับ OS & Banner)...")
@@ -1095,6 +1096,42 @@ class LanScannerApp:
             if extra_smb:
                 lines.append("\n[ข้อมูล SMB / Windows]")
                 lines.extend(extra_smb)
+
+        if res.smb_shares:
+            lines.append("\n[โฟลเดอร์แชร์ / เครื่องพิมพ์ (SMB Shares)]")
+            lines.append("  " + ", ".join(res.smb_shares))
+
+        if res.ssl_certs:
+            lines.append("\n[ใบรับรองความปลอดภัย (SSL/TLS Cert)]")
+            for c in res.ssl_certs:
+                lines.append(f"  Port {c.get('port', '')}: {c.get('ssl_subject', '-')}")
+                if c.get("ssl_san"):
+                    lines.append(f"    SAN: {c['ssl_san']}")
+                if c.get("ssl_expires"):
+                    lines.append(f"    หมดอายุ: {c['ssl_expires']}")
+
+        if res.snmp_info:
+            lines.append("\n[ข้อมูลระบบ SNMP]")
+            if res.snmp_info.get("sys_name"):
+                lines.append(f"  System Name: {res.snmp_info['sys_name']}")
+            if res.snmp_info.get("sys_descr"):
+                lines.append(f"  Model/Desc: {res.snmp_info['sys_descr']}")
+            if res.snmp_info.get("uptime"):
+                lines.append(f"  Uptime: {res.snmp_info['uptime']}")
+            if res.snmp_info.get("printer_supplies"):
+                lines.append(f"  หมึก/วัสดุพิมพ์: {res.snmp_info['printer_supplies']}")
+
+        if res.upnp_info:
+            lines.append("\n[ข้อมูล UPnP / SSDP]")
+            for k, lbl in (
+                ("friendlyName", "ชื่ออุปกรณ์"),
+                ("manufacturer", "ผู้ผลิต"),
+                ("modelName", "รุ่น (Model)"),
+                ("serialNumber", "Serial"),
+                ("server", "Server"),
+            ):
+                if res.upnp_info.get(k):
+                    lines.append(f"  {lbl}: {res.upnp_info[k]}")
 
         self.insp_ports_text.configure(state="normal")
         self.insp_ports_text.delete("1.0", "end")

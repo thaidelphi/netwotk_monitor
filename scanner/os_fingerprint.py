@@ -229,10 +229,25 @@ def probe_http_info(ip_str: str, port: int, use_ssl: bool = False, timeout: floa
             ctx.verify_mode = ssl.CERT_NONE
             conn = ctx.wrap_socket(raw_sock, server_hostname=ip_str)
             try:
-                cert = conn.getpeercert(binary_form=False)
-                if not cert:
-                    # With CERT_NONE, getpeercert() returns {}; try getpeercert(binary_form=True) or skip
-                    pass
+                der_cert = conn.getpeercert(binary_form=True)
+                if der_cert:
+                    from cryptography import x509
+
+                    cert_obj = x509.load_der_x509_certificate(der_cert)
+                    subj = cert_obj.subject.rfc4514_string()
+                    iss = cert_obj.issuer.rfc4514_string()
+                    result["ssl_subject"] = subj[:100]
+                    result["ssl_issuer"] = iss[:100]
+                    result["ssl_expires"] = cert_obj.not_valid_after_utc.strftime("%Y-%m-%d")
+                    try:
+                        san = cert_obj.extensions.get_extension_for_class(
+                            x509.SubjectAlternativeName
+                        )
+                        dns_names = san.value.get_values_for_type(x509.DNSName)
+                        if dns_names:
+                            result["ssl_san"] = ", ".join(dns_names[:5])
+                    except Exception:
+                        pass
             except Exception:
                 pass
         else:
@@ -299,15 +314,470 @@ def probe_generic_banner(ip_str: str, port: int, timeout: float = 0.35) -> str:
         return ""
 
 
-def collect_host_banners(ip_str: str, open_ports: list[int], timeout_scale: float = 1.0) -> dict[str, object]:
+def probe_mysql_banner(ip_str: str, port: int = 3306, timeout: float = 0.35) -> str:
+    """Parse MySQL / MariaDB initial handshake packet to extract exact server version."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            data = sock.recv(256)
+        if len(data) > 6 and data[4] == 10:
+            end = data.find(b"\x00", 5)
+            if end != -1:
+                ver = data[5:end].decode("utf-8", errors="ignore").strip()
+                if ver:
+                    return f"MySQL/MariaDB {ver}"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_rtsp_banner(ip_str: str, port: int = 554, timeout: float = 0.4) -> str:
+    """Send RTSP OPTIONS to identify IP camera / NVR firmware."""
+    req = f"OPTIONS rtsp://{ip_str}:{port}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode("ascii")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            sock.sendall(req)
+            resp = sock.recv(512).decode("utf-8", errors="ignore")
+        for line in resp.splitlines():
+            if line.lower().startswith("server:"):
+                return f"RTSP ({line.split(':', 1)[1].strip()[:70]})"
+        if resp.startswith("RTSP/"):
+            return resp.splitlines()[0].strip()[:60]
+    except Exception:
+        pass
+    return ""
+
+
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _ber_tlv(tag: int, val: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(val)) + val
+
+
+def _encode_oid(oid_str: str) -> bytes:
+    parts = [int(x) for x in oid_str.split(".")]
+    out = bytearray([parts[0] * 40 + parts[1]])
+    for sub in parts[2:]:
+        if sub == 0:
+            out.append(0)
+        else:
+            enc = []
+            while sub > 0:
+                enc.append(sub & 0x7F)
+                sub >>= 7
+            enc.reverse()
+            for i in range(len(enc) - 1):
+                enc[i] |= 0x80
+            out.extend(enc)
+    return _ber_tlv(0x06, bytes(out))
+
+
+def _read_ber_tlv(buf: bytes, pos: int) -> tuple[int, bytes, int]:
+    tag = buf[pos]
+    pos += 1
+    lbyte = buf[pos]
+    pos += 1
+    if lbyte & 0x80:
+        num = lbyte & 0x7F
+        length = int.from_bytes(buf[pos : pos + num], "big")
+        pos += num
+    else:
+        length = lbyte
+    val = buf[pos : pos + length]
+    return tag, val, pos + length
+
+
+def _decode_oid(raw: bytes) -> str:
+    if not raw:
+        return ""
+    res = [raw[0] // 40, raw[0] % 40]
+    val = 0
+    for b in raw[1:]:
+        val = (val << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            res.append(val)
+            val = 0
+    return ".".join(str(x) for x in res)
+
+
+def probe_rdp_ssl_cert(ip_str: str, port: int = 3389, timeout: float = 0.5) -> dict[str, str]:
+    """Perform X.224 RDP Negotiate (PROTOCOL_SSL) + TLS handshake to extract RDP server certificate info."""
+    info: dict[str, str] = {}
+    # TPKT(4) + X.224 CR(7) + RDP_NEG_REQ(8) requesting SSL (0x01)
+    rdp_neg = bytes.fromhex("030000130ee000000000000100080001000000")
+    try:
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(timeout)
+        raw.connect((ip_str, port))
+        raw.sendall(rdp_neg)
+        resp = raw.recv(64)
+        if len(resp) < 11:
+            raw.close()
+            return info
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with ctx.wrap_socket(raw, server_hostname=ip_str) as tls:
+            der_cert = tls.getpeercert(binary_form=True)
+            if der_cert:
+                from cryptography import x509
+
+                cert_obj = x509.load_der_x509_certificate(der_cert)
+                info["ssl_subject"] = cert_obj.subject.rfc4514_string()[:100]
+                info["ssl_issuer"] = cert_obj.issuer.rfc4514_string()[:100]
+                info["ssl_expires"] = cert_obj.not_valid_after_utc.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # If device is a printer or responded to SNMP, try querying Printer-MIB toner/ink levels (1.3.6.1.2.1.43.11.1.1)
+    if info and any(
+        kw in info.get("sys_descr", "").lower()
+        for kw in ("brother", "epson", "canon", "hewlett", "hp ", "ricoh", "kyocera", "xerox", "printer", "nc-")
+    ):
+        supplies: list[str] = []
+        for idx in range(1, 6):
+            oids_p = (
+                f"1.3.6.1.2.1.43.11.1.1.6.1.{idx}",  # prtMarkerSuppliesDescription
+                f"1.3.6.1.2.1.43.11.1.1.8.1.{idx}",  # prtMarkerSuppliesMaxCapacity
+                f"1.3.6.1.2.1.43.11.1.1.9.1.{idx}",  # prtMarkerSuppliesLevel
+            )
+            vb_p = b"".join(_ber_tlv(0x30, _encode_oid(o) + b"\x05\x00") for o in oids_p)
+            pdu_p = _ber_tlv(
+                0xA0,
+                _ber_tlv(0x02, (0x2000 + idx).to_bytes(2, "big"))
+                + _ber_tlv(0x02, b"\x00")
+                + _ber_tlv(0x02, b"\x00")
+                + _ber_tlv(0x30, vb_p),
+            )
+            msg_p = _ber_tlv(
+                0x30,
+                _ber_tlv(0x02, b"\x01") + _ber_tlv(0x04, community.encode("ascii")) + pdu_p,
+            )
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.settimeout(timeout)
+                    sock.sendto(msg_p, (ip_str, 161))
+                    resp_p, _ = sock.recvfrom(2048)
+                _, seq_b, _ = _read_ber_tlv(resp_p, 0)
+                p = 0
+                _, _, p = _read_ber_tlv(seq_b, p)
+                _, _, p = _read_ber_tlv(seq_b, p)
+                _, pdu_b, _ = _read_ber_tlv(seq_b, p)
+                q = 0
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, vbl_b, _ = _read_ber_tlv(pdu_b, q)
+                r = 0
+                desc_s, max_c, cur_l = "", 0, -1
+                while r < len(vbl_b):
+                    _, vb_i, r = _read_ber_tlv(vbl_b, r)
+                    k = 0
+                    _, oid_r, k = _read_ber_tlv(vb_i, k)
+                    vt, vr, _ = _read_ber_tlv(vb_i, k)
+                    os_str = _decode_oid(oid_r)
+                    if os_str.startswith("1.3.6.1.2.1.43.11.1.1.6.") and vt == 0x04:
+                        desc_s = vr.decode("utf-8", errors="ignore").strip()
+                    elif os_str.startswith("1.3.6.1.2.1.43.11.1.1.8.") and vt == 0x02:
+                        max_c = int.from_bytes(vr, "big", signed=True)
+                    elif os_str.startswith("1.3.6.1.2.1.43.11.1.1.9.") and vt == 0x02:
+                        cur_l = int.from_bytes(vr, "big", signed=True)
+                if desc_s:
+                    if max_c > 0 and cur_l >= 0:
+                        pct = min(100, int(round(cur_l * 100 / max_c)))
+                        supplies.append(f"{desc_s}: {pct}%")
+                    elif cur_l == -3:
+                        supplies.append(f"{desc_s}: OK")
+                    elif cur_l == 0:
+                        supplies.append(f"{desc_s}: 0% (Empty)")
+                    else:
+                        supplies.append(desc_s)
+            except Exception:
+                break
+        if supplies:
+            info["printer_supplies"] = " | ".join(supplies)
+
+    return info
+
+
+def probe_smb_shares(ip_str: str, timeout: float = 0.8) -> list[str]:
+    """Enumerate visible SMB shares via Windows NetShareEnum (netapi32.dll) with short timeout."""
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class _SHARE_INFO_1(ctypes.Structure):
+        _fields_ = [
+            ("shi1_netname", wt.LPWSTR),
+            ("shi1_type", wt.DWORD),
+            ("shi1_remark", wt.LPWSTR),
+        ]
+
+    shares: list[str] = []
+    try:
+        netapi32 = ctypes.windll.netapi32
+        buf_ptr = ctypes.c_void_p()
+        entries_read = wt.DWORD()
+        total_entries = wt.DWORD()
+        resume_handle = wt.DWORD(0)
+
+        ret = netapi32.NetShareEnum(
+            ctypes.c_wchar_p(f"\\\\{ip_str}"),
+            1,
+            ctypes.byref(buf_ptr),
+            0xFFFFFFFF,
+            ctypes.byref(entries_read),
+            ctypes.byref(total_entries),
+            ctypes.byref(resume_handle),
+        )
+        if ret == 0 and buf_ptr:
+            try:
+                arr = ctypes.cast(buf_ptr, ctypes.POINTER(_SHARE_INFO_1))
+                for i in range(entries_read.value):
+                    name = arr[i].shi1_netname or ""
+                    stype = arr[i].shi1_type & 0x0FFFFFFF
+                    kind = {0: "Disk", 1: "Printer", 2: "Device", 3: "IPC"}.get(stype, "Other")
+                    if name:
+                        shares.append(f"{name} ({kind})")
+            finally:
+                netapi32.NetApiBufferFree(buf_ptr)
+    except Exception:
+        pass
+    return shares[:20]
+
+
+def probe_vnc_banner(ip_str: str, port: int = 5900, timeout: float = 0.4) -> str:
+    """Read VNC RFB protocol version and supported security types."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            ver = sock.recv(64).decode("ascii", errors="ignore").strip()
+            if not ver.startswith("RFB "):
+                return ""
+            # Echo back client RFB version to read security types
+            sock.sendall((ver + "\n").encode("ascii"))
+            sec = sock.recv(32)
+            sec_names = {1: "None (No Auth!)", 2: "VNC Auth", 16: "Tight", 18: "TLS", 19: "VeNCrypt"}
+            if ver >= "RFB 003.007" and sec and sec[0] > 0:
+                types = [sec_names.get(b, f"Type {b}") for b in sec[1 : 1 + sec[0]]]
+                return f"{ver} [Auth: {', '.join(types[:4])}]"
+            return ver
+    except Exception:
+        return ""
+
+
+def probe_postgres_banner(ip_str: str, port: int = 5432, timeout: float = 0.35) -> str:
+    """Probe PostgreSQL port 5432 with SSLRequest to confirm PostgreSQL service & TLS support."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip_str, port))
+            # PostgreSQL SSLRequest packet: length=8, code=80877103
+            sock.sendall(struct.pack(">II", 8, 80877103))
+            resp = sock.recv(16)
+            if resp == b"S":
+                return "PostgreSQL (SSL Supported)"
+            if resp == b"N":
+                return "PostgreSQL (No SSL)"
+    except Exception:
+        pass
+    return ""
+
+
+def probe_snmp_sysinfo(ip_str: str, community: str = "public", timeout: float = 0.28) -> dict[str, str]:
+    """Query SNMPv2c UDP 161 for sysDescr (1.1.0), sysUpTime (1.3.0), sysName (1.5.0)."""
+    oids = ("1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.5.0")
+    varbinds = b"".join(_ber_tlv(0x30, _encode_oid(o) + b"\x05\x00") for o in oids)
+    req_id = 0x1234
+    pdu = _ber_tlv(
+        0xA0,
+        _ber_tlv(0x02, req_id.to_bytes(2, "big"))
+        + _ber_tlv(0x02, b"\x00")
+        + _ber_tlv(0x02, b"\x00")
+        + _ber_tlv(0x30, varbinds),
+    )
+    msg = _ber_tlv(
+        0x30,
+        _ber_tlv(0x02, b"\x01") + _ber_tlv(0x04, community.encode("ascii")) + pdu,
+    )
+    info: dict[str, str] = {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(msg, (ip_str, 161))
+            resp, _ = sock.recvfrom(4096)
+    except OSError:
+        return info
+
+    try:
+        _, seq_body, _ = _read_ber_tlv(resp, 0)
+        p = 0
+        _, _, p = _read_ber_tlv(seq_body, p)  # version
+        _, _, p = _read_ber_tlv(seq_body, p)  # community
+        _, pdu_body, _ = _read_ber_tlv(seq_body, p)
+        q = 0
+        _, _, q = _read_ber_tlv(pdu_body, q)  # req_id
+        _, _, q = _read_ber_tlv(pdu_body, q)  # err_status
+        _, _, q = _read_ber_tlv(pdu_body, q)  # err_idx
+        _, vbl_body, _ = _read_ber_tlv(pdu_body, q)
+        r = 0
+        while r < len(vbl_body):
+            _, vb_item, r = _read_ber_tlv(vbl_body, r)
+            k = 0
+            _, oid_raw, k = _read_ber_tlv(vb_item, k)
+            vtag, vraw, _ = _read_ber_tlv(vb_item, k)
+            oid_s = _decode_oid(oid_raw)
+            if oid_s == "1.3.6.1.2.1.1.1.0" and vtag == 0x04:
+                info["sys_descr"] = vraw.decode("utf-8", errors="ignore").strip()[:140]
+            elif oid_s == "1.3.6.1.2.1.1.3.0" and vtag == 0x43:
+                ticks = int.from_bytes(vraw, "big")
+                secs = ticks // 100
+                days, rem = divmod(secs, 86400)
+                hrs, rem = divmod(rem, 3600)
+                mins, _ = divmod(rem, 60)
+                info["uptime"] = f"{days} วัน {hrs} ชม. {mins} นาที" if days else f"{hrs} ชม. {mins} นาที"
+            elif oid_s == "1.3.6.1.2.1.1.5.0" and vtag == 0x04:
+                info["sys_name"] = vraw.decode("utf-8", errors="ignore").strip()[:80]
+    except Exception:
+        pass
+
+    # If device is a printer or responded to SNMP, try querying Printer-MIB toner/ink levels (1.3.6.1.2.1.43.11.1.1)
+    if info and any(
+        kw in info.get("sys_descr", "").lower()
+        for kw in ("brother", "epson", "canon", "hewlett", "hp ", "ricoh", "kyocera", "xerox", "printer", "nc-")
+    ):
+        supplies: list[str] = []
+        for idx in range(1, 6):
+            oids_p = (
+                f"1.3.6.1.2.1.43.11.1.1.6.1.{idx}",  # prtMarkerSuppliesDescription
+                f"1.3.6.1.2.1.43.11.1.1.8.1.{idx}",  # prtMarkerSuppliesMaxCapacity
+                f"1.3.6.1.2.1.43.11.1.1.9.1.{idx}",  # prtMarkerSuppliesLevel
+            )
+            vb_p = b"".join(_ber_tlv(0x30, _encode_oid(o) + b"\x05\x00") for o in oids_p)
+            pdu_p = _ber_tlv(
+                0xA0,
+                _ber_tlv(0x02, (0x2000 + idx).to_bytes(2, "big"))
+                + _ber_tlv(0x02, b"\x00")
+                + _ber_tlv(0x02, b"\x00")
+                + _ber_tlv(0x30, vb_p),
+            )
+            msg_p = _ber_tlv(
+                0x30,
+                _ber_tlv(0x02, b"\x01") + _ber_tlv(0x04, community.encode("ascii")) + pdu_p,
+            )
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.settimeout(timeout)
+                    sock.sendto(msg_p, (ip_str, 161))
+                    resp_p, _ = sock.recvfrom(2048)
+                _, seq_b, _ = _read_ber_tlv(resp_p, 0)
+                p = 0
+                _, _, p = _read_ber_tlv(seq_b, p)
+                _, _, p = _read_ber_tlv(seq_b, p)
+                _, pdu_b, _ = _read_ber_tlv(seq_b, p)
+                q = 0
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, _, q = _read_ber_tlv(pdu_b, q)
+                _, vbl_b, _ = _read_ber_tlv(pdu_b, q)
+                r = 0
+                desc_s, max_c, cur_l = "", 0, -1
+                while r < len(vbl_b):
+                    _, vb_i, r = _read_ber_tlv(vbl_b, r)
+                    k = 0
+                    _, oid_r, k = _read_ber_tlv(vb_i, k)
+                    vt, vr, _ = _read_ber_tlv(vb_i, k)
+                    os_str = _decode_oid(oid_r)
+                    if os_str.startswith("1.3.6.1.2.1.43.11.1.1.6.") and vt == 0x04:
+                        desc_s = vr.decode("utf-8", errors="ignore").strip()
+                    elif os_str.startswith("1.3.6.1.2.1.43.11.1.1.8.") and vt == 0x02:
+                        max_c = int.from_bytes(vr, "big", signed=True)
+                    elif os_str.startswith("1.3.6.1.2.1.43.11.1.1.9.") and vt == 0x02:
+                        cur_l = int.from_bytes(vr, "big", signed=True)
+                if desc_s:
+                    if max_c > 0 and cur_l >= 0:
+                        pct = min(100, int(round(cur_l * 100 / max_c)))
+                        supplies.append(f"{desc_s}: {pct}%")
+                    elif cur_l == -3:
+                        supplies.append(f"{desc_s}: OK")
+                    elif cur_l == 0:
+                        supplies.append(f"{desc_s}: 0% (Empty)")
+                    else:
+                        supplies.append(desc_s)
+            except Exception:
+                break
+        if supplies:
+            info["printer_supplies"] = " | ".join(supplies)
+
+    return info
+
+
+def probe_ssdp_upnp(ip_str: str, timeout: float = 0.25) -> dict[str, str]:
+    """Send unicast SSDP M-SEARCH to UDP 1900 for UPnP server/device description."""
+    msg = (
+        f"M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {ip_str}:1900\r\n"
+        f'MAN: "ssdp:discover"\r\n'
+        f"MX: 1\r\n"
+        f"ST: ssdp:all\r\n\r\n"
+    ).encode("ascii")
+    info: dict[str, str] = {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(msg, (ip_str, 1900))
+            resp, _ = sock.recvfrom(2048)
+        text = resp.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                kl = k.strip().lower()
+                if kl == "server" and "server" not in info:
+                    info["server"] = v.strip()[:90]
+                elif kl == "location" and "location" not in info:
+                    info["location"] = v.strip()[:120]
+        # Fetch UPnP XML description if hosted on same IP
+        loc = info.get("location", "")
+        if loc.startswith(f"http://{ip_str}"):
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(loc, timeout=0.4) as r:
+                    xml_txt = r.read(8192).decode("utf-8", errors="ignore")
+                for tag in ("friendlyName", "manufacturer", "modelName", "serialNumber"):
+                    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", xml_txt, re.IGNORECASE | re.DOTALL)
+                    if m and m.group(1).strip():
+                        info[tag] = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return info
+
+
+def collect_host_banners(
+    ip_str: str,
+    open_ports: list[int],
+    timeout_scale: float = 1.0,
+    probe_udp_services: bool = False,
+) -> dict[str, object]:
     """
-    Probe open ports on an alive host to gather OS clues and service banners.
-    Returns dict with keys: 'smb', 'ssh', 'http', 'banners' (dict[int, str]).
+    Probe open ports (and optional SNMP/SSDP) on an alive host to gather OS clues and service banners.
+    Returns dict with keys: 'smb', 'ssh', 'http', 'snmp', 'upnp', 'ssl_certs', 'banners'.
     """
     banners: dict[int, str] = {}
     smb_info: dict[str, str] = {}
     ssh_banner = ""
     http_infos: list[dict[str, str]] = []
+    ssl_certs: list[dict[str, str]] = []
     ports_set = set(open_ports)
 
     if 445 in ports_set:
@@ -337,17 +807,58 @@ def collect_host_banners(ip_str: str, open_ports: list[int], timeout_scale: floa
                     parts.append(hinfo["status"])
                 if parts:
                     banners[hp] = " | ".join(parts)
+                if hinfo.get("ssl_subject"):
+                    ssl_certs.append({"port": str(hp), **hinfo})
 
-    for gp in (21, 23, 25, 110, 143, 5900):
+    if 554 in ports_set:
+        rtsp_b = probe_rtsp_banner(ip_str, 554, timeout=0.4 * timeout_scale)
+        if rtsp_b:
+            banners[554] = rtsp_b
+
+    if 3306 in ports_set:
+        mysql_b = probe_mysql_banner(ip_str, 3306, timeout=0.35 * timeout_scale)
+        if mysql_b:
+            banners[3306] = mysql_b
+
+    if 5432 in ports_set:
+        pg_b = probe_postgres_banner(ip_str, 5432, timeout=0.35 * timeout_scale)
+        if pg_b:
+            banners[5432] = pg_b
+
+    if 5900 in ports_set:
+        vnc_b = probe_vnc_banner(ip_str, 5900, timeout=0.4 * timeout_scale)
+        if vnc_b:
+            banners[5900] = vnc_b
+
+    if 3389 in ports_set:
+        rdp_cert = probe_rdp_ssl_cert(ip_str, 3389, timeout=0.5 * timeout_scale)
+        if rdp_cert.get("ssl_subject"):
+            ssl_certs.append({"port": "3389", **rdp_cert})
+            banners[3389] = f"RDP TLS ({rdp_cert['ssl_subject']})"
+
+    for gp in (21, 23, 25, 110, 143):
         if gp in ports_set:
             gb = probe_generic_banner(ip_str, gp, timeout=0.35 * timeout_scale)
             if gb:
                 banners[gp] = gb
 
+    smb_shares: list[str] = []
+    snmp_info: dict[str, str] = {}
+    upnp_info: dict[str, str] = {}
+    if probe_udp_services:
+        snmp_info = probe_snmp_sysinfo(ip_str, timeout=0.32 * timeout_scale)
+        upnp_info = probe_ssdp_upnp(ip_str, timeout=0.28 * timeout_scale)
+        if 445 in ports_set:
+            smb_shares = probe_smb_shares(ip_str)
+
     return {
         "smb": smb_info,
+        "smb_shares": smb_shares,
         "ssh": ssh_banner,
         "http": http_infos,
+        "ssl_certs": ssl_certs,
+        "snmp": snmp_info,
+        "upnp": upnp_info,
         "banners": banners,
     }
 

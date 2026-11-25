@@ -63,6 +63,7 @@ class ScanConfig:
     port_timeout_sec: float = 0.35
     max_workers: int = 96
     resolve_hostname: bool = True
+    deep_inspect: bool = False
     local_interfaces: list[NetworkInterface] = field(default_factory=list)
 
 
@@ -83,6 +84,10 @@ class HostScanResult:
     open_ports: list[int] = field(default_factory=list)
     port_banners: dict[int, str] = field(default_factory=dict)
     smb_info: dict[str, str] = field(default_factory=dict)
+    smb_shares: list[str] = field(default_factory=list)
+    ssl_certs: list[dict[str, str]] = field(default_factory=list)
+    snmp_info: dict[str, str] = field(default_factory=dict)
+    upnp_info: dict[str, str] = field(default_factory=dict)
     discovery_method: str = "-"
     ttl: int | None = None
     deep_inspected: bool = False
@@ -607,14 +612,31 @@ class LanScannerEngine:
         vendor = lookup_mac_vendor(final_mac) if final_mac != "-" else "-"
 
         # 6. Banner Grabbing & OS Detection
-        banner_data = {"smb": {}, "ssh": "", "http": [], "banners": {}}
-        if open_ports_list and not self._stop_event.is_set():
-            banner_data = collect_host_banners(ip_str, open_ports_list, timeout_scale=1.0)
+        banner_data = {
+            "smb": {},
+            "smb_shares": [],
+            "ssh": "",
+            "http": [],
+            "ssl_certs": [],
+            "snmp": {},
+            "upnp": {},
+            "banners": {},
+        }
+        if (open_ports_list or config.deep_inspect) and not self._stop_event.is_set():
+            banner_data = collect_host_banners(
+                ip_str,
+                open_ports_list,
+                timeout_scale=1.0,
+                probe_udp_services=config.deep_inspect,
+            )
             smb_dict: dict[str, str] = banner_data["smb"]  # type: ignore[assignment]
+            snmp_dict: dict[str, str] = banner_data["snmp"]  # type: ignore[assignment]
             if hostname == "-" and smb_dict.get("dns_computer"):
                 hostname = smb_dict["dns_computer"]
             elif hostname == "-" and smb_dict.get("nb_computer"):
                 hostname = smb_dict["nb_computer"]
+            elif hostname == "-" and snmp_dict.get("sys_name"):
+                hostname = snmp_dict["sys_name"]
             if not workgroup and smb_dict.get("nb_domain"):
                 workgroup = smb_dict["nb_domain"]
 
@@ -655,8 +677,13 @@ class LanScannerEngine:
             open_ports=open_ports_list,
             port_banners=banner_data["banners"],  # type: ignore[arg-type]
             smb_info=banner_data["smb"],  # type: ignore[arg-type]
+            smb_shares=banner_data["smb_shares"],  # type: ignore[arg-type]
+            ssl_certs=banner_data["ssl_certs"],  # type: ignore[arg-type]
+            snmp_info=banner_data["snmp"],  # type: ignore[arg-type]
+            upnp_info=banner_data["upnp"],  # type: ignore[arg-type]
             discovery_method=discovery_method,
             ttl=ttl,
+            deep_inspected=config.deep_inspect,
         )
 
     def run_scan(
