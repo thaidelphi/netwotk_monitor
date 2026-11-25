@@ -335,7 +335,7 @@ def audit_host_vulnerabilities(res: HostScanResult) -> list[VulnFinding]:
         non_default_shares = [
             s
             for s in res.smb_shares
-            if not any(s.upper().startswith(adm) for adm in ("ADMIN$", "C$", "D$", "E$", "IPC$", "PRINT$"))
+            if not s.split(" (", 1)[0].strip().endswith("$")
         ]
         if non_default_shares:
             findings.append(
